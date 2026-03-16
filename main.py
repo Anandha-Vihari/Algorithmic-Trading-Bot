@@ -1,6 +1,7 @@
 import time
 import sys
 import threading
+import MetaTrader5 as mt5
 from datetime import datetime, timezone, timedelta
 
 # log to file (required when running with pythonw)
@@ -15,6 +16,7 @@ from trader import (
     get_position,
     manage_positions,
     profit_guard,
+    active_brain,
     init_mt5,
     show_open_positions,
     show_recent_history,
@@ -25,6 +27,7 @@ from state import processed_signals
 from config import *
 from slog import slog
 
+MAGIC_BY_FRAME = {"short": MAGIC_SHORT, "long": MAGIC_LONG}
 
 init_mt5()
 
@@ -37,7 +40,8 @@ _cycle_count  = 0   # used to throttle balance.log writes
 # used to detect APPEARED / DISAPPEARED / REAPPEARED / STATUS CHANGE
 
 _website_now  = {}   # sig_id → signal dict  (currently visible on website)
-_website_ever = set()  # sig_ids ever seen    (so we can log REAPPEARED vs APPEARED)
+_website_ever      = set()  # sig_ids ever seen    (so we can log REAPPEARED vs APPEARED)
+_close_ignored_ids = set()  # close signal ids already logged as IGNORED (suppress repeats)
 
 
 def _sig_id(s):
@@ -119,6 +123,11 @@ def run_signal_cycle():
 
         for s in signals:
             if s["status"] == "ACTIVE":
+                # ignore stale signals (>1 day old) so they don't cause false conflicts
+                if s["time"] is not None:
+                    age_min = (now - s["time"]).total_seconds() / 60
+                    if age_min > 1440:
+                        continue
                 pair = s["pair"]
                 website_sides.setdefault(pair, set()).add(s["side"])
                 website_frames.setdefault(pair, set()).add(s["frame"])
@@ -154,9 +163,16 @@ def run_signal_cycle():
             elif s["status"] == "CLOSE":
                 close_signals.append(s)
 
-        # ── STEP 3: analyse — confluence filter ───────────────────────────────
+        # ── STEP 3: analyse ───────────────────────────────────────────────────
         to_open  = []
         to_close = []
+
+        # block new entries outside market hours (fri 21:00+ UTC, sat, sun before 21:00 UTC)
+        market_open = not (
+            (now.weekday() == 4 and now.hour >= 21) or
+             now.weekday() == 5 or
+            (now.weekday() == 6 and now.hour < 21)
+        )
 
         for pair, sigs in active_by_pair.items():
 
@@ -168,25 +184,16 @@ def run_signal_cycle():
                      "website shows BUY+SELL across frames — not trading")
                 continue
 
+            if not market_open:
+                slog(pair, sigs[0]["frame"], "SKIP MARKET", "outside trading hours")
+                continue
+
             side = list(website_sides.get(pair, {"??"}))[0]
 
-            # confluence check: when trading both frames, require BOTH to agree
-            if TRADE_FRAME == "both":
-                frames_active = website_frames.get(pair, set())
-                has_short = "short" in frames_active
-                has_long  = "long"  in frames_active
-                if not (has_short and has_long):
-                    # only one timeframe visible — wait for the other to confirm
-                    only = "short" if has_short else "long"
-                    slog(pair, only, "WAIT CONF",
-                         f"only {only} frame active — waiting for other TF to confirm")
-                    continue   # do NOT mark processed — retry next cycle
-
-            # both frames agree (or single-frame mode) — pick most recent signal
-            best = max(sigs, key=lambda x: x["time"] or now)
-            frames_str = "+".join(sorted(website_frames.get(pair, set())))
-            slog(pair, best["frame"], "CONFLUENT", f"{side} confirmed on [{frames_str}]")
-            to_open.append((best, sigs))
+            # execute each frame independently — no confluence wait
+            for s in sigs:
+                slog(s["pair"], s["frame"], "SIGNAL", f"{side} [{s['frame']}]")
+                to_open.append((s, [s]))
 
         for s in close_signals:
             if s["pair"] not in active_pairs:
@@ -199,40 +206,61 @@ def run_signal_cycle():
             pair = s["pair"]
             pos  = get_position(pair)
             if pos:
-                slog(pair, s["frame"], "WEBSITE CLOSE", "closing per signal")
-                close_trade(pair)
-                closed_this_cycle.add(pair)
+                if REVERSE_SIGNALS:
+                    sid = _sig_id(s)
+                    if sid not in _close_ignored_ids:
+                        slog(pair, s["frame"], "WEBSITE CLOSE IGNORED", "reverse mode — letting trail/TP exit")
+                        _close_ignored_ids.add(sid)
+                else:
+                    slog(pair, s["frame"], "WEBSITE CLOSE", "closing per signal")
+                    close_trade(pair)
+                    closed_this_cycle.add(pair)
 
         # ── STEP 5: execute opens ─────────────────────────────────────────────
         just_opened = set()
 
         for best, all_sigs in to_open:
-            pair = best["pair"]
+            pair  = best["pair"]
+            magic = MAGIC_BY_FRAME[best["frame"]]
 
-            existing = get_position(pair)
+            # check only this frame's existing position
+            existing = None
+            for name in (pair, pair + "+"):
+                for p in (mt5.positions_get(symbol=name) or []):
+                    if p.magic == magic:
+                        existing = p
+                        break
+                if existing:
+                    break
+
+            # 1-per-pair: if other frame already has a position, skip this frame
+            if existing is None:
+                other_magic = MAGIC_LONG if magic == MAGIC_SHORT else MAGIC_SHORT
+                for name in (pair, pair + "+"):
+                    for p in (mt5.positions_get(symbol=name) or []):
+                        if p.magic == other_magic:
+                            slog(pair, best["frame"], "SKIP PAIR",
+                                 "other frame already open — 1-per-pair limit")
+                            for s in all_sigs:
+                                processed_signals[f"{pair}_{s['time']}_{s['side']}_{s['frame']}"] = now
+                            existing = "skip"
+                            break
+                    if existing:
+                        break
+                if existing == "skip":
+                    continue
+
             if existing:
                 pos_side = "BUY" if existing.type == 0 else "SELL"
-                if pos_side == best["side"]:
-                    # already open in correct direction — mark all processed
+                # in reverse mode the bot trades opposite to the website signal
+                expected_side = ("SELL" if best["side"] == "BUY" else "BUY") if REVERSE_SIGNALS else best["side"]
+                if pos_side == expected_side:
+                    # already open in correct direction — mark processed
                     for s in all_sigs:
                         processed_signals[f"{pair}_{s['time']}_{s['side']}_{s['frame']}"] = now
                     continue
 
-                # opposite direction open — only reverse if BOTH frames confirm new side
-                frames_active = website_frames.get(pair, set())
-                if TRADE_FRAME == "both" and len(frames_active) < 2:
-                    # single-frame reversal signal — close existing but don't flip
-                    print(f"CLOSE ONLY: {pair} — single frame reversal, closing {pos_side} without opening {best['side']}")
-                    slog(pair, best["frame"], "CLOSE ONLY",
-                         f"single TF says {best['side']} — closing {pos_side}, not reversing")
-                    close_trade(pair)
-                    for s in all_sigs:
-                        processed_signals[f"{pair}_{s['time']}_{s['side']}_{s['frame']}"] = now
-                    closed_this_cycle.add(pair)
-                    continue
-
-                # both frames confirm reversal — close and flip
-                print(f"REVERSE: {pair} {pos_side} -> {best['side']} (both TF confirmed)")
+                # opposite direction — close this frame and re-open
                 slog(pair, best["frame"], "REVERSAL",
                      f"closing {pos_side} -> opening {best['side']}")
                 close_trade(pair)
@@ -283,6 +311,7 @@ def guard_thread():
         try:
             with mt5_lock:
                 profit_guard()
+                active_brain()
         except Exception as e:
             print("GUARD ERROR:", e)
         time.sleep(GUARD_INTERVAL)

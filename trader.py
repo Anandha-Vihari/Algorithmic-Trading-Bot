@@ -10,6 +10,8 @@ MAGIC_BY_FRAME = {"short": MAGIC_SHORT, "long": MAGIC_LONG}
 
 _peak_profit    = {}   # ticket → highest profit (USD) seen while trade was open
 _profit_history = {}   # ticket → deque of (timestamp, profit) — rolling window for rapid-drop detection
+_partial_closed = set()  # tickets where 50% was already booked
+_tp_extended    = set()  # tickets where TP was already pushed out
 
 
 def init_mt5():
@@ -41,7 +43,7 @@ def open_trade(signal):
         side = "SELL" if side == "BUY" else "BUY"
         sl   = tp   # original TP becomes our stop loss
         tp   = 0    # placeholder — will be set from price × REVERSE_RR below
-        print(f"REVERSE: {pair} [{signal['frame']}] signal={signal['side']} → trading {side}")
+        print(f"REVERSE: {pair} [{signal['frame']}] signal={signal['side']} -> trading {side}")
 
     # resolve symbol: try bare name then + suffix, retry up to 3x per name
     sym = None
@@ -101,14 +103,19 @@ def open_trade(signal):
         else:
             sl = signal["sl"]
 
-    # for reversed trades: calculate TP from the SL distance and target R:R
+    # for reversed trades:
+    #   SL = original TP price (meaningful market level, already stored in sl)
+    #   TP = price ± 2 × (distance to original TP) → clean 2:1 R:R
     if REVERSE_SIGNALS:
-        sl_dist = abs(price - sl)
+        orig_sl_dist = abs(price - sl)   # sl holds original TP price
         if side == "BUY":
-            tp = round(price + sl_dist * REVERSE_RR, sym.digits)
+            tp = round(price + orig_sl_dist * 2, sym.digits)
+            # sl stays as original TP (below entry for BUY ✓)
         else:
-            tp = round(price - sl_dist * REVERSE_RR, sym.digits)
-        print(f"REVERSE RR: {pair} entry={price}  SL={sl}  TP={tp}  (1:{REVERSE_RR})")
+            tp = round(price - orig_sl_dist * 2, sym.digits)
+            # sl stays as original TP (above entry for SELL ✓)
+        sl = round(sl, sym.digits)
+        print(f"REVERSE RR: {pair} entry={price}  SL={sl}  TP={tp}  (2:1)")
 
     # R:R check: reward (TP distance from current price) must be >= MIN_RR_RATIO × risk (SL distance)
     tp_dist_now = abs(tp - price)
@@ -359,7 +366,7 @@ def profit_guard():
     floor and retain level are left alone so profits keep running.
     """
     positions = mt5.positions_get()
-    if not positions:
+    if not positions or not PROFIT_GUARD_ENABLED:
         return
 
     now_ts = time.time()
@@ -438,6 +445,197 @@ def profit_guard():
                  f"profit guard @ {result.price}  locked ${p.profit:.2f}")
         else:
             print(f"PROFIT GUARD CLOSE FAILED: {p.symbol} retcode={result.retcode}")
+
+
+# ── Active Trade Brain ─────────────────────────────────────────────────────────
+
+def _momentum_score(ticket):
+    """Returns -2..+2: profit trend over last 30s and 60s. Negative = falling."""
+    hist = _profit_history.get(ticket)
+    if not hist or len(hist) < 3:
+        return 0
+    now_ts  = time.time()
+    current = hist[-1][1]
+    score   = 0
+    for window in (30, 60):
+        past = next((pnl for ts, pnl in reversed(list(hist)) if now_ts - ts >= window), None)
+        if past is not None:
+            score += 1 if current > past else (-1 if current < past else 0)
+    return score
+
+
+def _brain_close(p, tick, frame, reason):
+    close_type  = mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    close_price = tick.bid             if p.type == mt5.POSITION_TYPE_BUY else tick.ask
+    result = mt5.order_send({
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "position":     p.ticket,
+        "symbol":       p.symbol,
+        "volume":       p.volume,
+        "type":         close_type,
+        "price":        close_price,
+        "deviation":    20,
+        "magic":        p.magic,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_time":    mt5.ORDER_TIME_GTC
+    })
+    if result.retcode == 10009:
+        slog(p.symbol, frame, "CLOSED", f"brain {reason} @ {result.price}  pnl=${p.profit:.2f}")
+    else:
+        print(f"BRAIN CLOSE FAILED: {p.symbol} retcode={result.retcode}")
+    return result.retcode == 10009
+
+
+def _brain_sltp(p, new_sl, new_tp, sym, frame, reason):
+    result = mt5.order_send({
+        "action":   mt5.TRADE_ACTION_SLTP,
+        "position": p.ticket,
+        "symbol":   p.symbol,
+        "sl":       round(new_sl, sym.digits),
+        "tp":       round(new_tp, sym.digits)
+    })
+    if result.retcode in (10009, 10025):
+        print(f"BRAIN: {p.symbol} [{frame}] {reason}")
+        slog(p.symbol, frame, "BRAIN", reason)
+    else:
+        print(f"BRAIN SLTP FAILED: {p.symbol} retcode={result.retcode}")
+
+
+def active_brain():
+    """
+    Runs every second. Six behaviours:
+
+    1. DEAD TRADE KILLER  — close if peak never reached $0.05 after 30 min
+    2. DOLLAR STOP        — close immediately if floating loss exceeds $0.60
+    3. PROFIT LOCK        — move SL to breakeven when floating profit reaches $0.30
+    4. PROFIT TRAIL       — trail SL behind price once trade is 30%+ into TP
+    5. TP EXTENSION       — push TP 50% further when price is at 80% and still moving
+    6. PARTIAL CLOSE      — lock 50% at 60% of TP (only when lot >= 2x broker minimum)
+    """
+    if not BRAIN_ENABLED:
+        return
+
+    positions = mt5.positions_get()
+    if not positions:
+        return
+
+    now    = datetime.now(timezone.utc)
+    now_ts = time.time()
+
+    for p in positions:
+        if p.magic not in (MAGIC_SHORT, MAGIC_LONG):
+            continue
+        if p.tp == 0:
+            continue
+
+        frame = "short" if p.magic == MAGIC_SHORT else "long"
+        sym   = mt5.symbol_info(p.symbol)
+        tick  = mt5.symbol_info_tick(p.symbol)
+        if sym is None or tick is None:
+            continue
+
+        # update shared state
+        hist = _profit_history.setdefault(p.ticket, deque(maxlen=120))
+        hist.append((now_ts, p.profit))
+        peak = max(_peak_profit.get(p.ticket, p.profit), p.profit)
+        _peak_profit[p.ticket] = peak
+
+        age_mins = (now - datetime.fromtimestamp(p.time, tz=timezone.utc)).total_seconds() / 60
+
+        if p.type == mt5.POSITION_TYPE_BUY:
+            tp_dist  = p.tp - p.price_open
+            cur_move = tick.bid - p.price_open
+        else:
+            tp_dist  = p.price_open - p.tp
+            cur_move = p.price_open - tick.ask
+
+        if tp_dist <= 0:
+            continue
+
+        pct = cur_move / tp_dist * 100
+
+        # ── 1. DEAD TRADE KILLER ──────────────────────────────────────────────
+        if age_mins >= BRAIN_DEAD_MINS and peak < BRAIN_DEAD_MIN_PROFIT:
+            print(f"BRAIN DEAD TRADE: {p.symbol} [{frame}] {age_mins:.0f}min  peak=${peak:.2f}")
+            slog(p.symbol, frame, "DEAD TRADE", f"{age_mins:.0f}min open, never profitable — closing")
+            _brain_close(p, tick, frame, "dead trade")
+            continue
+
+        # ── 2. DOLLAR STOP LOSS ───────────────────────────────────────────────
+        # close immediately if floating loss exceeds $0.60 — hard cap per trade
+        if p.profit <= -DOLLAR_STOP_LOSS:
+            print(f"DOLLAR STOP: {p.symbol} [{frame}] loss=${p.profit:.2f} — closing")
+            slog(p.symbol, frame, "DOLLAR STOP", f"loss=${p.profit:.2f} hit -${DOLLAR_STOP_LOSS} cap")
+            _brain_close(p, tick, frame, f"dollar stop ${p.profit:.2f}")
+            continue
+
+        # ── 3. PROFIT LOCK (SL → breakeven at $0.30 profit) ─────────────────
+        # once trade hits +$0.30, slide SL to entry so it can't turn into a loss
+        if p.profit >= PROFIT_LOCK_USD:
+            be = round(p.price_open, sym.digits)
+            if p.type == mt5.POSITION_TYPE_BUY:
+                if round(p.sl, sym.digits) < be:
+                    _brain_sltp(p, be, p.tp, sym, frame,
+                                f"profit lock SL->BE (profit=+${p.profit:.2f})")
+            else:
+                if p.sl == 0 or round(p.sl, sym.digits) > be:
+                    _brain_sltp(p, be, p.tp, sym, frame,
+                                f"profit lock SL->BE (profit=+${p.profit:.2f})")
+
+        score = _momentum_score(p.ticket)
+
+        # ── 4. PROFIT PROTECTION TRAIL ────────────────────────────────────────
+        # once trade is ≥30% into TP, keep SL trailing behind current price
+        if pct >= 30 and p.profit > 0:
+            if p.type == mt5.POSITION_TYPE_BUY:
+                new_sl    = round(tick.bid - BRAIN_EMERGENCY_TRAIL * tp_dist, sym.digits)
+                min_move  = 10 ** (-sym.digits + 1)
+                if new_sl > round(p.sl, sym.digits) + min_move:
+                    _brain_sltp(p, new_sl, p.tp, sym, frame,
+                                f"profit trail SL->{new_sl} ({pct:.0f}% of TP)")
+            else:
+                new_sl   = round(tick.ask + BRAIN_EMERGENCY_TRAIL * tp_dist, sym.digits)
+                min_move = 10 ** (-sym.digits + 1)
+                if p.sl == 0 or new_sl < round(p.sl, sym.digits) - min_move:
+                    _brain_sltp(p, new_sl, p.tp, sym, frame,
+                                f"profit trail SL->{new_sl} ({pct:.0f}% of TP)")
+
+        # ── 5. TP EXTENSION ───────────────────────────────────────────────────
+        if p.ticket not in _tp_extended and pct >= BRAIN_TP_EXTEND_PCT * 100 and score >= 1:
+            extra = tp_dist * (BRAIN_TP_EXTEND_MULT - 1)
+            if p.type == mt5.POSITION_TYPE_BUY:
+                new_tp = round(p.tp + extra, sym.digits)
+            else:
+                new_tp = round(p.tp - extra, sym.digits)
+            _brain_sltp(p, p.sl, new_tp, sym, frame,
+                        f"TP extended {p.tp}->{new_tp} ({pct:.0f}% of orig, score={score})")
+            _tp_extended.add(p.ticket)
+
+        # ── 6. PARTIAL CLOSE ──────────────────────────────────────────────────
+        if p.ticket not in _partial_closed and pct >= BRAIN_PARTIAL_PCT * 100 and p.profit > 0:
+            half = round(p.volume / 2, 2)
+            if half >= sym.volume_min:
+                close_type  = mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+                close_price = tick.bid             if p.type == mt5.POSITION_TYPE_BUY else tick.ask
+                result = mt5.order_send({
+                    "action":       mt5.TRADE_ACTION_DEAL,
+                    "position":     p.ticket,
+                    "symbol":       p.symbol,
+                    "volume":       half,
+                    "type":         close_type,
+                    "price":        close_price,
+                    "deviation":    20,
+                    "magic":        p.magic,
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                    "type_time":    mt5.ORDER_TIME_GTC
+                })
+                if result.retcode == 10009:
+                    _partial_closed.add(p.ticket)
+                    slog(p.symbol, frame, "PARTIAL CLOSE",
+                         f"50% @ {close_price}  locked ~${p.profit/2:.2f}")
+                    # move SL to breakeven on remaining half
+                    _brain_sltp(p, p.price_open, p.tp, sym, frame,
+                                "SL->breakeven after partial close")
 
 
 def show_open_positions():
