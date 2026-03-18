@@ -18,7 +18,7 @@ MAX_POSITIONS = 10     # Max concurrent positions
 
 # ─── MT5 ────────────────────────────────────────────────────────────────────
 
-MT5_LOGIN = 24343206
-MT5_PASSWORD = "oiAZ!5s6"
+MT5_LOGIN = 24446623
+MT5_PASSWORD = "Z2Nf&3eE"
 MT5_SERVER = "VantageInternational-Demo"
-MT5_EXE    = r"C:\Users\h\AppData\Roaming\MetaTrader 5\terminal64.exe"
+MT5_EXE    = r"C:\Program Files\MetaTrader 5\terminal64.exe" 
