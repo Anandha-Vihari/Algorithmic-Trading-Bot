@@ -9,7 +9,7 @@ import time
 import subprocess
 import MetaTrader5 as mt5
 from datetime import datetime, timezone
-from config import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_EXE, TRADE_VOLUME, DOLLAR_STOP_LOSS
+from config import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_EXE, TRADE_VOLUME
 
 MAGIC_NUMBER = 777  # All trades use same magic (no frame distinction in blind mode)
 
@@ -48,6 +48,23 @@ def open_trade(signal):
     side = signal["side"]
     tp = signal["tp"]
     sl = signal["sl"]
+
+    # ─── MT5 Duplicate Prevention: Check if position already exists ─────
+    # (main.py filters processed_signals, but we double-check MT5 here)
+    existing = None
+    for name in (pair, pair + "+"):
+        positions = mt5.positions_get(symbol=name)
+        if positions:
+            for pos in positions:
+                if pos.magic == MAGIC_NUMBER:
+                    existing = pos
+                    break
+        if existing:
+            break
+
+    if existing:
+        print(f"  [SKIP] Position already exists for {pair}")
+        return False
 
     # ─── Get symbol ──────────────────────────────────────────────────────
     sym = None
