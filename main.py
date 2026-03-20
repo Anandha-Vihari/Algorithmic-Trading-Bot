@@ -250,7 +250,7 @@ def run_signal_cycle():
 
         pair = s["pair"]
         frame = s["frame"]
-        signal_id = f"{pair}_{s['time']}_{s['side']}_{frame}"
+        signal_id = f"{pair}_{s['time']}_{s['side']}_{frame}_{s['tp']}_{s['sl']}"
 
         # Skip if already processed
         if signal_id in processed_signals:
@@ -285,8 +285,8 @@ def run_signal_cycle():
         pair = s["pair"]
         frame = s["frame"]
 
-        # Create unique close signal ID
-        close_signal_id = f"{pair}_{s['time']}_CLOSE_{frame}"
+        # Create unique close signal ID (include TP/SL to differentiate multiple closes)
+        close_signal_id = f"{pair}_{s['time']}_CLOSE_{frame}_{s.get('tp')}_{s.get('sl')}"
 
         # Skip if we already processed this exact close signal
         if close_signal_id in processed_signals:
