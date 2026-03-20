@@ -29,7 +29,7 @@ from scraper import fetch_page
 from parser import parse_signals
 from trader import open_trade, close_trade, close_position_by_ticket, get_position, init_mt5, show_open_positions, account_summary
 from state import processed_signals, position_tracker
-from config import SIGNAL_INTERVAL, TRADE_VOLUME
+from config import SIGNAL_INTERVAL, TRADE_VOLUME, MAX_SIGNAL_AGE
 
 print(f"\n{'='*80}")
 print("BLIND FOLLOWER BOT - STARTED")
@@ -215,6 +215,16 @@ def run_signal_cycle():
             filtered_signals.append(s)
 
     signals = filtered_signals
+
+    # ──── FILTER BY AGE: Skip signals older than MAX_SIGNAL_AGE ──────────────
+
+    age_filtered = []
+    for s in signals:
+        signal_age = (now - s['time']).total_seconds()
+        if signal_age <= MAX_SIGNAL_AGE:
+            age_filtered.append(s)
+
+    signals = age_filtered
 
     # ──── PROCESS ACTIVE SIGNALS (with frame lock for dedup) ────────────────
 

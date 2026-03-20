@@ -11,6 +11,7 @@ PROXY_ROTATION_STRATEGY = "round_robin"
 
 # ─── TIMING ────────────────────────────────────────────────────────────────
 SIGNAL_INTERVAL = 10   # Check website every 7 seconds
+MAX_SIGNAL_AGE = 1800  # Skip signals older than 30 minutes (1800 seconds)
 
 # ─── TRADING ────────────────────────────────────────────────────────────────
 TRADE_VOLUME = 0.01    # Lot size
