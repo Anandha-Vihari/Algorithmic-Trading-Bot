@@ -87,11 +87,14 @@ class _PositionTracker:
     def find_matching_position(self, pair, frame, tp=None, sl=None):
         """Find position by pair+frame.
 
-        Matching strategy (in order of priority):
+        Matching strategy:
         1. If TP and SL provided, match by exact TP/SL values (most reliable)
+           - If found → return it (exact match!)
+           - If NOT found → return None (close signal is NOT for our trades)
         2. Otherwise return oldest position (FIFO - first to open, first to close)
 
-        TP/SL matching is the key - they uniquely identify each trade!
+        KEY: TP/SL matching is definitive. If no match with provided TP/SL,
+        the close signal belongs to a different trade (or already closed).
         """
         matches = []
         for signal_id, metadata in self._data.items():
@@ -106,15 +109,17 @@ class _PositionTracker:
         if len(matches) == 1:
             return matches[0]
 
-        # If multiple matches and TP/SL provided, match by TP/SL values
+        # If multiple matches and TP/SL provided, ONLY match by exact TP/SL values
         if tp is not None and sl is not None and len(matches) > 1:
             for signal_id, metadata in matches:
-                # Check if TP and SL match (they should be stored if available)
+                # Check if TP and SL match exactly
                 if (metadata.get('tp') == tp and metadata.get('sl') == sl):
                     return signal_id, metadata
-            # If no exact TP/SL match, fall through to FIFO
+            # If no exact TP/SL match found, return None
+            # This means: "Close signal doesn't belong to any of our open positions"
+            return None, None
 
-        # Multiple matches, no TP/SL: return OLDEST (FIFO)
+        # Multiple matches, no TP/SL provided: return OLDEST (FIFO)
         oldest = min(matches, key=lambda x: x[1].get('created_at', ''))
         return oldest
 
