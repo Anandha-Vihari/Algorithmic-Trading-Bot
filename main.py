@@ -215,13 +215,14 @@ def run_signal_cycle():
             continue
 
         # Open trade
-        print(f"[{now.strftime('%H:%M:%S')}] SIGNAL: {pair} {s['side']} @ {s['open']} SL:{s['sl']} TP:{s['tp']}")
+        signal_time_str = s['time'].strftime('%H:%M:%S') if hasattr(s['time'], 'strftime') else str(s['time'])
+        print(f"[{now.strftime('%H:%M:%S')}] SIGNAL: {pair} {s['side']} @ {s['open']} [Signal time: {signal_time_str}, Frame: {frame}]")
 
         success, ticket = open_trade(s)
         if success:
             opened += 1
             active_frame[pair] = frame  # Lock this frame for this pair
-            print(f"  → OPENED ✓")
+            print(f"  → OPENED ✓ Ticket: {ticket} (Signal ID: {signal_id})")
             # Track position if ticket was obtained
             if ticket:
                 position_tracker.add(signal_id, ticket, pair, frame, s['open'], s['side'], s['time'])
@@ -254,10 +255,10 @@ def run_signal_cycle():
         matching_signal_id, metadata = position_tracker.find_matching_position(pair, frame, s['open'])
 
         if matching_signal_id and metadata:
-            print(f"[{now.strftime('%H:%M:%S')}] CLOSE: {pair} @ {s['open']}")
-            print(f"  Matched to Signal ID: {matching_signal_id}")
-            print(f"  Original signal time: {metadata.get('signal_time', 'unknown')}")
-            print(f"  Closing Ticket: {metadata['ticket']}")
+            print(f"[{now.strftime('%H:%M:%S')}] CLOSE: {pair} @ {s['open']} [Frame: {frame}]")
+            print(f"  ✓ Matched to signal ID: {matching_signal_id}")
+            print(f"    Signal time: {metadata.get('signal_time', 'unknown')} | Original price: {metadata['open_price']} | Side: {metadata['side']}")
+            print(f"    Ticket: {metadata['ticket']}")
 
             if close_position_by_ticket(metadata["ticket"], pair):
                 closed += 1
@@ -266,16 +267,21 @@ def run_signal_cycle():
                 remaining = len([m for sid, m in position_tracker.all_positions() if m["pair"] == pair])
                 if remaining == 0 and pair in active_frame:
                     del active_frame[pair]  # Unlock pair only if no more positions
-                print(f"  → CLOSED ✓")
+                print(f"  ✓ CLOSED")
 
         else:
             # No matching position found
-            print(f"[{now.strftime('%H:%M:%S')}] CLOSE: {pair} @ {s['open']} (no matching position found)")
-            print(f"  ⚠ WARN: No tracked position for {pair} on frame {frame}")
+            print(f"[{now.strftime('%H:%M:%S')}] CLOSE: {pair} @ {s['open']} [Frame: {frame}]")
+            print(f"  ✗ No matching position found!")
             print(f"  Available tracked positions for {pair}:")
+            found_any = False
             for sid, meta in position_tracker.all_positions():
                 if meta["pair"] == pair:
-                    print(f"    - Signal {sid}: price {meta['open_price']}, frame {meta['frame']}")
+                    found_any = True
+                    print(f"    - Signal: {sid}")
+                    print(f"      Time: {meta.get('signal_time', 'unknown')} | Price: {meta['open_price']} | Frame: {meta['frame']} | Ticket: {meta['ticket']}")
+            if not found_any:
+                print(f"    (None)")
             # Don't auto-close unmatched - website should provide correct price
 
         # Mark close signal as processed to prevent duplicates
