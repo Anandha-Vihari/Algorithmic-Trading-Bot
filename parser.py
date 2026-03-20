@@ -65,10 +65,19 @@ def _parse_rows(html, frame):
             # This is a CLOSE signal - extract it
             status = "CLOSE"
             close_price = float(close_price_match.group(1))
+
+            # Detect close reason
+            if "Achieved" in text:
+                close_reason = "Achieved"
+            elif "Trailing Stop" in text or "trailing" in text.lower():
+                close_reason = "Trailing Stop"
+            else:
+                close_reason = "Manual"
         else:
             # This is an ACTIVE signal with no close yet
             status = "ACTIVE"
             close_price = None
+            close_reason = None
 
         side = "BUY" if "Buy" in text else "SELL"
 
@@ -82,6 +91,7 @@ def _parse_rows(html, frame):
             "status": status,
             "frame":  frame,
             "close":  close_price,
+            "close_reason": close_reason,
         })
 
     return signals

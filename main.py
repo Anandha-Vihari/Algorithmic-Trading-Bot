@@ -287,7 +287,8 @@ def run_signal_cycle():
         matching_signal_id, metadata = position_tracker.find_matching_position(pair, frame, tp=s.get('tp'), sl=s.get('sl'))
 
         if matching_signal_id and metadata:
-            print(f"[{now.strftime('%H:%M:%S')}] CLOSE: {pair} @ {s['open']} [Frame: {frame}] TP:{s.get('tp')} SL:{s.get('sl')}")
+            close_reason = s.get('close_reason', 'Unknown')
+            print(f"[{now.strftime('%H:%M:%S')}] CLOSE: {pair} @ {s.get('close')} [Frame: {frame}] ({close_reason}) TP:{s.get('tp')} SL:{s.get('sl')}")
             print(f"  ✓ Matched to signal ID: {matching_signal_id}")
             print(f"    Signal time: {metadata.get('signal_time', 'unknown')} | Original price: {metadata['open_price']} | Side: {metadata['side']}")
             print(f"    TP match: {metadata.get('tp')} | SL match: {metadata.get('sl')}")
@@ -304,7 +305,8 @@ def run_signal_cycle():
 
         else:
             # No matching position found
-            print(f"[{now.strftime('%H:%M:%S')}] CLOSE: {pair} @ {s['open']} [Frame: {frame}]")
+            close_reason = s.get('close_reason', 'Unknown')
+            print(f"[{now.strftime('%H:%M:%S')}] CLOSE: {pair} @ {s.get('close')} [Frame: {frame}] ({close_reason})")
             print(f"  ✗ No matching position found!")
             print(f"  Available tracked positions for {pair}:")
             found_any = False
