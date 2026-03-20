@@ -92,10 +92,10 @@ def cleanup_stale_positions():
     if stale_count > 0:
         print(f"[CLEANUP] Removed {stale_count} stale position(s)")
 
-cleanup_stale_positions()
-
 # Track which frame is active per pair (frame lock)
 active_frame = {}
+
+cleanup_stale_positions()
 
 # Log tracked positions at startup
 tracked = position_tracker.all_positions()
