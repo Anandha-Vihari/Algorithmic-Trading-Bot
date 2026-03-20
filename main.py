@@ -29,7 +29,7 @@ from scraper import fetch_page
 from parser import parse_signals
 from trader import open_trade, close_trade, close_position_by_ticket, get_position, init_mt5, show_open_positions, account_summary
 from state import processed_signals, position_tracker
-from config import SIGNAL_INTERVAL, TRADE_VOLUME, POSITION_PRICE_TOLERANCE
+from config import SIGNAL_INTERVAL, TRADE_VOLUME
 
 print(f"\n{'='*80}")
 print("BLIND FOLLOWER BOT - STARTED")
@@ -42,7 +42,7 @@ def prune_signals(filepath, hours=24):
     try:
         with open(filepath, 'r') as f:
             data = json.load(f)
-        cutoff = datetime.utcnow() - timedelta(hours=hours)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         pruned = {
             k: v for k, v in data.items()
             if datetime.fromisoformat(v) > cutoff
@@ -269,9 +269,9 @@ def run_signal_cycle():
                 print(f"  → CLOSED ✓")
 
         else:
-            # No matching position found - log but still try to close ANY position on this pair
+            # No matching position found
             print(f"[{now.strftime('%H:%M:%S')}] CLOSE: {pair} @ {s['open']} (no matching position found)")
-            print(f"  ⚠ WARN: No tracked position matched (price: {s['open']}, tolerance: ±{POSITION_PRICE_TOLERANCE})")
+            print(f"  ⚠ WARN: No tracked position for {pair} on frame {frame}")
             print(f"  Available tracked positions for {pair}:")
             for sid, meta in position_tracker.all_positions():
                 if meta["pair"] == pair:

@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 _FILE = "processed_signals.json"
 _POSITIONS_FILE = "open_positions.json"
@@ -58,14 +58,23 @@ class _PositionTracker:
 
     def add(self, signal_id, ticket, pair, frame, open_price, side, signal_time=None):
         """Store mapping: signal_id → position metadata."""
+        # Handle signal_time as string or datetime
+        if signal_time:
+            if hasattr(signal_time, 'isoformat'):
+                time_str = signal_time.isoformat()
+            else:
+                time_str = str(signal_time)
+        else:
+            time_str = None
+
         self._data[signal_id] = {
             "ticket": ticket,
             "pair": pair,
             "frame": frame,
             "open_price": open_price,
             "side": side,
-            "signal_time": signal_time.isoformat() if signal_time else None,
-            "created_at": datetime.utcnow().isoformat()  # When we opened it
+            "signal_time": time_str,
+            "created_at": datetime.now(timezone.utc).isoformat()  # When we opened it
         }
         self._save()
 
