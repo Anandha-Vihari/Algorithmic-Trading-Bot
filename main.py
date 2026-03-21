@@ -27,8 +27,9 @@ from scraper import fetch_page
 from parser import parse_signals
 from trader import open_trade, close_position_by_ticket, init_mt5, show_open_positions, account_summary
 from signal_manager import (
-    Signal, SignalKey, PositionStore, StateDifferencer, SignalFilter, SafeExecutor
+    Signal, SignalKey, PositionStore, StateDifferencer, SignalFilter, SafeExecutor, FuzzyMatcher
 )
+from operational_safety import OperationalSafety, log, LogLevel
 from config import SIGNAL_INTERVAL, TRADE_VOLUME, MAX_SIGNAL_AGE
 
 print(f"\n{'='*80}")
@@ -41,6 +42,9 @@ init_mt5()
 
 # Persistent position tracker
 positions = PositionStore()
+
+# Operational safety monitoring and retry control
+safety = OperationalSafety(max_retries=5, unmatched_threshold=3)
 
 # Persistent signal processing tracker (prevent duplicate opens)
 processed_signals_file = "processed_signals.json"
@@ -76,18 +80,83 @@ def get_signal_id(sig: Signal) -> str:
     return f"{time_str}_{key}"
 
 
+def reconstruct_positions_from_mt5(mt5_positions_list, signals_to_process, positions_store):
+    """Reconstruct position tracker from MT5 live state + fuzzy matching to signals.
+
+    SAFETY FEATURES:
+    1. Time filtering: Only match signals from same trading session (24h window)
+    2. Confidence check: Best match must be 50% better than second-best
+    3. Unmatched safety: Ambiguous matches sent to UNMATCHED bucket (never closed)
+
+    Args:
+        mt5_positions_list: List of MT5 position objects
+        signals_to_process: List of Signal objects (already filtered, deduplicated)
+        positions_store: PositionStore instance to populate
+
+    Returns:
+        (reconstructed_count, unmatched_count) - tickets loaded and fallback count
+    """
+    # Build dict of signals by key for fast lookup: {key: [Signal, ...]}
+    signals_by_key = {}
+    for sig in signals_to_process:
+        key = SignalKey.build(sig.pair, sig.side, sig.tp, sig.sl)
+        if key not in signals_by_key:
+            signals_by_key[key] = []
+        signals_by_key[key].append(sig)
+
+    reconstructed = 0
+    unmatched = 0
+
+    for pos in mt5_positions_list:
+        if pos.magic != 777:  # Not our positions
+            continue
+
+        # Extract MT5 position details
+        pair = pos.symbol
+        tp = pos.tp
+        sl = pos.sl
+        ticket = pos.ticket
+        side = "BUY" if pos.type == 0 else "SELL"
+
+        # Extract MT5 position open time (safe conversion)
+        mt5_time_opened = None
+        try:
+            if hasattr(pos, 'time'):
+                # Convert Unix timestamp to datetime
+                mt5_time_opened = datetime.fromtimestamp(pos.time, tz=timezone.utc)
+            elif hasattr(pos, 'time_setup'):
+                mt5_time_opened = datetime.fromtimestamp(pos.time_setup, tz=timezone.utc)
+        except Exception:
+            pass  # If can't extract time, will still match (time_compatible returns True)
+
+        # Find best match with SAFETY CHECKS
+        best_key, best_signal, best_score, is_confident = FuzzyMatcher.find_best_match_with_confidence(
+            tp, sl, mt5_time_opened, signals_by_key
+        )
+
+        threshold = FuzzyMatcher.get_threshold(pair)
+
+        # CRITICAL: Require BOTH distance threshold AND confidence
+        if best_key is not None and best_score <= threshold and is_confident:
+            # MATCHED with high confidence: Reconstruct with this key
+            positions_store.add_ticket(best_key, ticket)
+            reconstructed += 1
+            print(f"  [RECONSTRUCT] {pair} {side} ticket {ticket} -> key {best_key} (score={best_score:.6f}, confident)")
+        else:
+            # UNMATCHED: Either no match, threshold exceeded, or ambiguous
+            fallback_key = ("_UNMATCHED_", pair, side, tp, sl)
+            positions_store.add_ticket(fallback_key, ticket)
+            unmatched += 1
+
+            reason = "ambiguous" if (best_key is not None and best_score <= threshold and not is_confident) else "no_match"
+            print(f"  [UNMATCHED] {pair} {side} ticket {ticket} @ TP={tp} SL={sl} ({reason}, score={best_score:.6f})")
+
+    return reconstructed, unmatched
+
+
 # Load processed signals at startup
 processed_signal_ids = load_processed_signals()
 print(f"[STARTUP] Loaded {len(processed_signal_ids)} processed signal IDs (last 24h)")
-
-# Load positions from MT5 at startup
-mt5_positions = mt5.positions_get() or []
-print(f"[STARTUP] Found {len(mt5_positions)} positions in MT5")
-for pos in mt5_positions:
-    if pos.magic != 777:  # Not our positions
-        continue
-    # TODO: Reconstruct position tracker from MT5 positions
-    # For now, we start fresh each cycle
 
 print()
 
@@ -205,19 +274,58 @@ def run_signal_cycle():
     # ──── CLOSE TRADES (SAFE) ────────────────────────────────────────────────
 
     close_count = 0
+    escalated_count = 0
     if closed:
-        print(f"\n[CLOSE] Processing {len(closed)} key(s) to close...")
+        log(LogLevel.INFO, f"Processing {len(closed)} key(s) to close")
+
+        # Get current MT5 positions for stale detection
+        mt5_positions = mt5.positions_get() or []
 
         ops = SafeExecutor.prepare_close_operations(closed, positions)
-        for key, count, ticket in ops:
+        for key, ticket in ops:
+            # CRITICAL SAFETY: Never close unmatched positions
+            if key[0] == "_UNMATCHED_":
+                log(LogLevel.INFO, f"Skipping UNMATCHED ticket {ticket} - unmatched positions never closed")
+                continue
+
+            # STALE DETECTION: Check if ticket was manually closed in MT5
+            if safety.check_stale_tickets(ticket, mt5_positions):
+                positions.remove_ticket(ticket)
+                continue
+
             try:
+                # Attempt close
                 if close_position_by_ticket(ticket, key[0]):
+                    # Success - NOW remove ticket from tracking
+                    positions.remove_ticket(ticket)
                     close_count += 1
-                    print(f"  [OK] Closed ticket {ticket} for {key}")
+                    safety.handle_close_success(ticket)
+                    log(LogLevel.INFO, f"Closed and removed ticket {ticket} for {key[0]}")
+
                 else:
-                    print(f"  [ERR] Failed to close ticket {ticket}")
+                    # Failed - ticket STAYS in positions for retry next cycle
+                    # Track failure with escalation
+                    action = safety.handle_close_failure(ticket, key[0], "close_position_by_ticket returned False")
+
+                    if action == "ESCALATE":
+                        # Move to failed close bucket
+                        failed_key = ("_FAILED_CLOSE_", key[0], key[2], key[3])
+                        positions.remove_ticket(ticket)
+                        positions.add_ticket(failed_key, ticket)
+                        escalated_count += 1
+                        log(LogLevel.CRITICAL, f"Escalated ticket {ticket} to _FAILED_CLOSE_ bucket after max retries")
+
             except Exception as e:
-                print(f"  [ERR] Exception closing {ticket}: {e}")
+                # Exception - ticket STAYS in positions for retry next cycle
+                action = safety.handle_close_failure(ticket, key[0], str(e))
+
+                if action == "ESCALATE":
+                    # Move to failed close bucket
+                    failed_key = ("_FAILED_CLOSE_", key[0], key[2], key[3])
+                    positions.remove_ticket(ticket)
+                    positions.add_ticket(failed_key, ticket)
+                    escalated_count += 1
+                    log(LogLevel.CRITICAL, f"Escalated ticket {ticket} to _FAILED_CLOSE_ bucket after max retries (exception)")
 
     # ──── OPEN TRADES ────────────────────────────────────────────────────────
 
@@ -287,8 +395,32 @@ def run_signal_cycle():
 
     # ──── STATUS ─────────────────────────────────────────────────────────────
 
-    print(f"\n[{now_str}] Cycle complete: {open_count} opened, {close_count} closed")
-    print(f"  Tracked positions: {sum(len(t) for t in positions.positions.values())} tickets")
+    # Count position types
+    total_tickets = sum(len(t) for t in positions.positions.values())
+    unmatched_tickets = len(positions.positions.get(("_UNMATCHED_",) + tuple([None] * 4), []))
+    failed_close_tickets = len(positions.positions.get(("_FAILED_CLOSE_",) + tuple([None] * 4), []))
+
+    # Determine actual unmatched keys
+    unmatched_count = 0
+    failed_close_count = 0
+    for key in positions.positions.keys():
+        if key[0] == "_UNMATCHED_":
+            unmatched_count += len(positions.positions[key])
+        elif key[0] == "_FAILED_CLOSE_":
+            failed_close_count += len(positions.positions[key])
+
+    log(LogLevel.INFO, f"Cycle complete: {open_count} opened, {close_count} closed, {escalated_count} escalated")
+    log(LogLevel.INFO, f"Tracked: {total_tickets} tickets | UNMATCHED: {unmatched_count} | FAILED_CLOSE: {failed_close_count}")
+
+    # Monitor UNMATCHED growth
+    safety.check_unmatched_growth(unmatched_count)
+
+    # Log safety status periodically
+    import random
+    if random.random() < 0.1:  # ~10% of cycles
+        status = safety.get_status_report()
+        if status["total_escalated"] > 0:
+            log(LogLevel.WARN, f"Safety status - Escalated: {status['total_escalated']}, Tickets: {status['escalated_tickets']}")
 
     show_open_positions()
     account_summary()
@@ -323,6 +455,60 @@ def signal_thread():
 # ══════════════════════════════════════════════════════════════════════════════
 # START
 # ══════════════════════════════════════════════════════════════════════════════
+
+# Initial MT5 reconstruction - must happen BEFORE signal cycle starts
+# because first signal cycle will compute prev_keys = positions.get_all_keys()
+print("\n[STARTUP] Initial MT5 reconstruction...")
+
+# Fetch and parse one signal snapshot first
+try:
+    html = fetch_page()
+    if html is not None:
+        raw_signals = parse_signals(html)
+
+        # Convert to Signal objects and filter
+        signals = []
+        for raw in raw_signals:
+            try:
+                sig = Signal(
+                    pair=raw['pair'],
+                    side=raw['side'],
+                    open_price=raw['open'],
+                    tp=raw['tp'],
+                    sl=raw['sl'],
+                    time=raw['time'],
+                    frame=raw['frame'],
+                    status=raw['status'],
+                    close_price=raw.get('close'),
+                    close_reason=raw.get('close_reason'),
+                )
+                signals.append(sig)
+            except Exception as e:
+                pass  # Skip malformed
+
+        # Filter: ACTIVE signals only, age, then deduplicate
+        active_signals = [s for s in signals if s.status == "ACTIVE"]
+        active_signals = SignalFilter.filter_by_age(active_signals, MAX_SIGNAL_AGE)
+        signals_to_process = sorted(active_signals, key=lambda s: s.time, reverse=True)
+        signals_to_process = SignalFilter.deduplicate_by_key(signals_to_process)
+
+        if signals_to_process:
+            mt5_positions = mt5.positions_get() or []
+            if mt5_positions:
+                reconstructed, unmatched = reconstruct_positions_from_mt5(
+                    mt5_positions, signals_to_process, positions
+                )
+                print(f"[STARTUP] Reconstructed {reconstructed} positions, {unmatched} unmatched\n")
+            else:
+                print(f"[STARTUP] No existing MT5 positions to reconstruct\n")
+        else:
+            print(f"[STARTUP] Could not reconstruct - no valid signals available\n")
+    else:
+        print(f"[STARTUP] Could not reconstruct - failed to fetch signals\n")
+except Exception as e:
+    print(f"[STARTUP] Reconstruction error: {e}\n")
+    import traceback
+    traceback.print_exc()
 
 threading.Thread(target=signal_thread, daemon=True).start()
 

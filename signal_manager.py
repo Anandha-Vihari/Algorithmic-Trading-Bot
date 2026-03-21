@@ -82,6 +82,129 @@ class SignalKey:
         SignalKey.PRECISION = precision
 
 
+class FuzzyMatcher:
+    """Match MT5 positions to website signals using distance-based scoring."""
+
+    THRESHOLD_STANDARD = 0.01      # Default threshold (most pairs)
+    THRESHOLD_JPY = 1.0            # JPY pairs (4+ decimals)
+
+    @staticmethod
+    def calculate_score(signal_tp, signal_sl, mt5_tp, mt5_sl) -> float:
+        """Calculate distance score: abs(tp_diff) + abs(sl_diff)"""
+        return abs(signal_tp - mt5_tp) + abs(signal_sl - mt5_sl)
+
+    @staticmethod
+    def get_threshold(pair: str) -> float:
+        """JPY pairs use larger threshold (4+ decimals)."""
+        return FuzzyMatcher.THRESHOLD_JPY if "JPY" in pair else FuzzyMatcher.THRESHOLD_STANDARD
+
+    @staticmethod
+    def is_time_compatible(signal_time, mt5_time_opened, max_hours: int = 24) -> bool:
+        """Check if signal and MT5 trade opened within reasonable time window.
+
+        Args:
+            signal_time: datetime object (UTC) when signal was created
+            mt5_time_opened: datetime object (UTC) when MT5 position opened
+            max_hours: Maximum time difference in hours (default 24 = same day)
+
+        Returns:
+            bool: True if within time window, False if too old/future
+        """
+        if signal_time is None or mt5_time_opened is None:
+            return True  # Can't verify, assume compatible
+
+        try:
+            time_diff_hours = abs((signal_time - mt5_time_opened).total_seconds() / 3600)
+            return time_diff_hours <= max_hours
+        except Exception:
+            return True  # Safe fallback: assume compatible if comparison fails
+
+    @staticmethod
+    def find_best_match_with_confidence(mt5_tp, mt5_sl, mt5_time, signals_by_key):
+        """Find best match with time validation and confidence check.
+
+        SAFETY RULES:
+        1. Time compatibility: Signal and MT5 position within 24 hours
+        2. Confidence threshold: Best match must be 50% better than 2nd best
+        3. Ambiguous matches: Rejected and sent to UNMATCHED bucket
+
+        Args:
+            mt5_tp: MT5 position take profit
+            mt5_sl: MT5 position stop loss
+            mt5_time: datetime when MT5 position opened
+            signals_by_key: Dict of {key: [Signal]}
+
+        Returns:
+            (best_key, best_signal, best_score, is_confident) - Tuple with confidence flag
+        """
+        best_key = None
+        best_signal = None
+        best_score = float('inf')
+        second_best_score = float('inf')
+
+        for key, sigs in signals_by_key.items():
+            if not sigs:
+                continue
+
+            sig = sigs[0]
+
+            # SAFETY: Check time compatibility (prevent old trade mis-mapping)
+            if not FuzzyMatcher.is_time_compatible(sig.time, mt5_time):
+                continue
+
+            score = FuzzyMatcher.calculate_score(sig.tp, sig.sl, mt5_tp, mt5_sl)
+
+            if score < best_score:
+                # Previous best becomes second best
+                second_best_score = best_score
+                best_score = score
+                best_key = key
+                best_signal = sig
+            elif score < second_best_score:
+                second_best_score = score
+
+        # SAFETY: Confidence check - best significantly better than second best (0.5 = 50%)
+        # Only accept if best is clearly the winner, not ambiguous
+        is_confident = (
+            best_key is not None
+            and best_score < float('inf')
+            and second_best_score < float('inf')
+            and best_score < (second_best_score * 0.5)
+        )
+
+        return best_key, best_signal, best_score, is_confident
+
+    @staticmethod
+    def find_best_match(mt5_tp, mt5_sl, signals_by_key):
+        """Find closest signal match.
+
+        Args:
+            mt5_tp: MT5 position take profit level
+            mt5_sl: MT5 position stop loss level
+            signals_by_key: Dict of {key: [Signal, ...]} (already deduplicated)
+
+        Returns:
+            (best_key, best_signal, best_score) - (Key tuple, Signal object, score) or (None, None, inf)
+        """
+        best_key = None
+        best_signal = None
+        best_score = float('inf')
+
+        for key, sigs in signals_by_key.items():
+            if not sigs:
+                continue
+            # Use first signal for this key (already deduplicated)
+            sig = sigs[0]
+            score = FuzzyMatcher.calculate_score(sig.tp, sig.sl, mt5_tp, mt5_sl)
+
+            if score < best_score:
+                best_score = score
+                best_key = key
+                best_signal = sig
+
+        return best_key, best_signal, best_score
+
+
 class PositionStore:
     """Thread-safe position storage: {key: [ticket1, ticket2, ...]}"""
 
@@ -112,6 +235,40 @@ class PositionStore:
     def has_key(self, key: Tuple) -> bool:
         """Check if key exists and has tickets."""
         return key in self.positions and len(self.positions[key]) > 0
+
+    def get_n_tickets_for_close(self, key: Tuple, count: int) -> List[int]:
+        """Get last N tickets for this key WITHOUT removing (LIFO order).
+
+        Used to prepare close operations without modifying state.
+        Always returns requested tickets in LIFO order (newest last).
+
+        Args:
+            key: Signal key
+            count: Number of tickets to get
+
+        Returns:
+            List of ticket IDs (up to count, LIFO order)
+        """
+        tickets = self.positions.get(key, [])
+        return list(tickets[-count:]) if count > 0 and tickets else []
+
+    def remove_ticket(self, ticket: int) -> bool:
+        """Remove specific ticket by ID from any key.
+
+        Called AFTER successful close to update state.
+        Searches all keys to find and remove ticket.
+
+        Args:
+            ticket: Ticket ID to remove
+
+        Returns:
+            bool: True if found and removed, False if not found
+        """
+        for key, tickets in self.positions.items():
+            if ticket in tickets:
+                tickets.remove(ticket)
+                return True
+        return False
 
     def clear(self):
         """Clear all positions (for testing)."""
@@ -262,31 +419,42 @@ class SafeExecutor:
     def prepare_close_operations(
         closed_counter: Counter,
         position_store: PositionStore
-    ) -> List[Tuple[Tuple, int, Optional[int]]]:
+    ) -> List[Tuple[Tuple, int]]:
         """
-        Prepare safe close operations.
+        Prepare safe close operations WITHOUT removing tickets yet.
 
-        For each key in closed_counter:
-        - Validate we CAN close
-        - Calculate safe close count
-        - Prepare ticket to close
+        CRITICAL CHANGE: Tickets are NOT removed here. They are only removed
+        AFTER successful close confirmation. This prevents ticket loss if
+        close attempts fail.
+
+        SAFETY RULES:
+        1. UNMATCHED positions are skipped entirely (never processed)
+        2. Tickets are collected WITHOUT modification
+        3. Caller is responsible for removing after successful close
 
         Args:
             closed_counter: Dict of {key: count_to_close}
             position_store: Our position tracker
 
         Returns:
-            List of (key, close_count, ticket_to_close) tuples
+            List of (key, ticket) tuples to attempt closing
+            Tickets NOT yet removed from positions
 
         Example:
             [
-                (("EURUSD", "BUY", 1.158, 1.154), 1, 12345),
-                (("GBPUSD", "SELL", 1.278, 1.272), 1, 12346),
+                (("EURUSD", "BUY", 1.158, 1.154), 12345),
+                (("GBPUSD", "SELL", 1.278, 1.272), 12346),
             ]
         """
         operations = []
 
         for key, count_to_close in closed_counter.items():
+            # CRITICAL SAFETY: Skip UNMATCHED positions entirely
+            # They should never be closed (guard prevents it anyway)
+            if key[0] == "_UNMATCHED_":
+                print(f"  [SKIP_UNMATCHED] Won't process {key}: unmatched positions remain unchanged")
+                continue
+
             is_valid, reason = SafeExecutor.validate_close(
                 key, count_to_close, position_store
             )
@@ -298,11 +466,13 @@ class SafeExecutor:
             # Safe close: use min() to never close more than available
             safe_close_count = min(count_to_close, position_store.count_for_key(key))
 
-            # Get tickets to close (LIFO)
-            for _ in range(safe_close_count):
-                ticket = position_store.pop_ticket(key)
+            # Get tickets to close (LIFO) WITHOUT removing them yet
+            # Tickets stay in positions until close succeeds
+            tickets_to_close = position_store.get_n_tickets_for_close(key, safe_close_count)
+
+            for ticket in tickets_to_close:
                 if ticket:
-                    operations.append((key, 1, ticket))
+                    operations.append((key, ticket))
 
         return operations
 
