@@ -18,6 +18,7 @@ A fully autonomous forex trading bot that **blindly follows website signals** wi
 10. [Troubleshooting](#troubleshooting)
 11. [Advanced Topics](#advanced-topics)
 12. [FAQ](#faq)
+13. [Technical Documentation](#technical-documentation)
 
 ---
 
@@ -672,6 +673,44 @@ Bot:
 1. Save signals to file
 2. Simulate opening/closing offline
 3. Compare simulated P&L to actual bot P&L
+
+---
+
+## Technical Documentation
+
+This project includes comprehensive technical documentation:
+
+### [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md)
+Complete technical guide covering:
+- Trade identification system (composite signal IDs with TP/SL)
+- Open trade logic (deduplication, age filtering, duplicate prevention)
+- Close trade logic (TP/SL matching with tolerance, ticket-based closes)
+- MT5 position handling (magic number 777, filtered by magic)
+- Signal parsing (complete field extraction and close reason detection)
+- State management (persistent JSON storage for signals and positions)
+- Order placement structure (magic number, comment, type filling)
+- Multiple trades per pair (TP/SL-based differentiation)
+- Restart behavior (loading state from disk, stale position cleanup)
+- Edge case walkthrough (full execution trace for complex scenarios)
+
+**Use this for:** Understanding how the bot identifies, opens, and closes trades.
+
+### [CRITICAL_ANALYSIS.md](CRITICAL_ANALYSIS.md)
+Rigorous analysis of potential failure points and edge cases:
+1. Identity Consistency Test - Does website provide trade identifiers?
+2. Snapshot vs Event Model - Is data event-based or snapshot-based?
+3. Duplicate Trade Scenario - Can identical TP/SL cause wrong closes?
+4. Missing TP/SL Fallback - What if close signal lacks TP/SL?
+5. Tolerance Collision - Can two trades fall within 0.001 range?
+6. Time Instability - Do relative timestamps create unstable IDs? (CRITICAL BUG)
+7. Broker Adjustment Reality - What if MT5 adjusts TP/SL beyond tolerance?
+8. Worst-Case Scenario - Full walkthrough of ambiguous close scenario
+9. Determinism Check - Is matching deterministic or probabilistic?
+10. Alternative Model Challenge - Comparison with staleness tracking approach
+
+Summary: System works for ~90% of normal cases but has critical failure points in edge cases.
+
+**Use this for:** Understanding limitations, risks, and recommended improvements.
 
 ---
 
