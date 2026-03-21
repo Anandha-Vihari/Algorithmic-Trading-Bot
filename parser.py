@@ -4,18 +4,26 @@ from datetime import datetime, timezone, timedelta
 
 
 def parse_time(text):
-    """Parse time from signal row. Handles:
-    1. Absolute format: "2024-01-15 10:30 AM UTC"
-    2. Relative format: "31 mins ago", "9 hours ago", "1 day ago", etc.
+    """Parse time from signal row.
+
+    CRITICAL: Use absolute UTC time only. Relative times ("24 mins ago") are
+    UNRELIABLE across bot cycles because they produce different timestamps
+    each time the bot runs.
+
+    Handles:
+    1. Absolute format: "2024-01-15 10:30 AM UTC" (RELIABLE)
+    2. Falls back to relative if no absolute found (UNRELIABLE but better than current time)
     """
 
-    # Try absolute timestamp first
+    # Try absolute timestamp FIRST - this is the ONLY reliable method
     match = re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} [AP]M UTC", text)
     if match:
         t = datetime.strptime(match.group(), "%Y-%m-%d %I:%M %p UTC")
         return t.replace(tzinfo=timezone.utc)
 
-    # Handle relative times: "31 mins ago", "9 hours ago", "1 day ago", etc.
+    # FALLBACK: Handle relative times (not ideal but better than current time)
+    # WARNING: This will produce different timestamps each bot cycle!
+    # The website SHOULD provide absolute UTC time.
     relative_match = re.search(r"(\d+)\s+(min|hour|day)s?\s+ago", text, re.IGNORECASE)
     if relative_match:
         amount = int(relative_match.group(1))
@@ -29,7 +37,10 @@ def parse_time(text):
         elif unit == "day":
             return now - timedelta(days=amount)
 
-    # Fallback: use current time if we can't parse
+    # FALLBACK: use current time if we can't parse
+    # THIS IS A SIGN THE WEBSITE FORMAT HAS CHANGED!
+    import sys
+    print("[WARNING] Could not parse timestamp from signal. Using current time as fallback.", file=sys.stderr)
     return datetime.now(timezone.utc)
 
 
