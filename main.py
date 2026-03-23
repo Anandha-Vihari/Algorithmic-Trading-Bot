@@ -507,10 +507,10 @@ def run_signal_cycle():
                 log(LogLevel.INFO, f"Skipping {key} - recently closed by virtual SL, waiting for signal reset")
                 continue
 
-            # Find matching signal IN FRESH SIGNALS ONLY (< 30 min age)
-            # Only open trades from fresh signals, not old ones
+            # Find matching signal from ALL active signals (not just fresh)
+            # Opened keys come from ALL signals, need to search there
             matching_signals = [
-                s for s in signals_to_open
+                s for s in signals_to_manage
                 if s.pair == pair and s.side == side
                 and round(s.tp, 3) == round(tp, 3)
                 and round(s.sl, 3) == round(sl, 3)
@@ -531,15 +531,7 @@ def run_signal_cycle():
             # Open trades for this key
             for i in range(count):
                 try:
-                    success, ticket = open_trade({
-                        'pair': sig.pair,
-                        'side': sig.side,
-                        'open': sig.open_price,
-                        'tp': sig.tp,
-                        'sl': sig.sl,
-                        'time': sig.time,
-                        'frame': sig.frame,
-                    })
+                    success, ticket = open_trade(sig)
 
                     if success and ticket:
                         positions.add_ticket(key, ticket)
