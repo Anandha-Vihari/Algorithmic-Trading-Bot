@@ -35,21 +35,14 @@ def open_trade(signal):
 
     Returns: (success: bool, ticket: int or None)
 
-    signal = {
-        'pair': 'EURUSD',
-        'side': 'BUY',
-        'open': 1.08500,
-        'tp': 1.09000,
-        'sl': 1.08000,
-        'frame': 'short',
-        ...
-    }
+    signal = Signal object with attributes:
+        pair, side, open_price, tp, sl, frame, ...
     """
 
-    pair = signal["pair"]
-    side = signal["side"]
-    tp = signal["tp"]
-    sl = signal["sl"]
+    pair = signal.pair
+    side = signal.side
+    tp = signal.tp
+    sl = signal.sl
 
     # ─── Get symbol ──────────────────────────────────────────────────────
     sym = None
@@ -96,7 +89,7 @@ def open_trade(signal):
 
     if result.retcode == 10009:
         actual_price = result.price
-        signal_price = signal["open"]
+        signal_price = signal.open_price
         price_diff = abs(actual_price - signal_price)
 
         if price_diff > 0.0001:
