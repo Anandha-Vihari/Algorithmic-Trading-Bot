@@ -30,6 +30,7 @@ from signal_manager import (
     Signal, SignalKey, PositionStore, StateDifferencer, SignalFilter, SafeExecutor, FuzzyMatcher
 )
 from operational_safety import OperationalSafety, log, LogLevel
+from virtual_sl import init_virtual_sl, get_virtual_sl_manager
 from config import SIGNAL_INTERVAL, TRADE_VOLUME, MAX_SIGNAL_AGE
 
 print(f"\n{'='*80}")
@@ -45,6 +46,9 @@ positions = PositionStore()
 
 # Operational safety monitoring and retry control
 safety = OperationalSafety(max_retries=5, unmatched_threshold=3)
+
+# Virtual SL - Spread-aware stop loss management
+virtual_sl = init_virtual_sl(spread_factor=1.5)
 
 # Persistent signal processing tracker (prevent duplicate opens)
 processed_signals_file = "processed_signals.json"
@@ -272,6 +276,23 @@ def run_signal_cycle():
     print(f"  Previous state: {len(prev_keys)} keys")
     print(f"  Current state: {len(curr_keys)} keys")
 
+    # ──── VIRTUAL SL CHECK (SPREAD-AWARE) ─────────────────────────────────────
+    # Check and close positions that hit virtual SL (accounts for spread changes)
+
+    mt5_positions = mt5.positions_get() or []
+    virtual_sl_closes = virtual_sl.check_and_close_all(
+        mt5, positions, lambda t, p: close_position_by_ticket(t, p)
+    )
+
+    if virtual_sl_closes:
+        log(LogLevel.INFO, f"Virtual SL closed {len(virtual_sl_closes)} position(s)")
+        for ticket, key, reason in virtual_sl_closes:
+            log(LogLevel.DEBUG, f"  {reason}")
+
+    # ──── CLEANUP CLOSED_BY_BOT FOR REAPPEARED SIGNALS ──────────────────────────
+    # If signal reappears after being closed by virtual SL, allow reopen
+    virtual_sl.cleanup_closed_signals(curr_keys)
+
     # ──── COMPUTE DIFF ───────────────────────────────────────────────────────
 
     closed, opened = StateDifferencer.compute_diff(prev_keys, curr_keys)
@@ -313,6 +334,7 @@ def run_signal_cycle():
                 if close_position_by_ticket(ticket, key[0]):
                     # Success - NOW remove ticket from tracking
                     positions.remove_ticket(ticket)
+                    virtual_sl.remove_position(ticket)  # Remove from virtual SL tracking
                     close_count += 1
                     safety.handle_close_success(ticket)
                     log(LogLevel.INFO, f"Closed and removed ticket {ticket} for {key[0]}")
@@ -327,6 +349,7 @@ def run_signal_cycle():
                         failed_key = ("_FAILED_CLOSE_", key[0], key[2], key[3])
                         positions.remove_ticket(ticket)
                         positions.add_ticket(failed_key, ticket)
+                        virtual_sl.remove_position(ticket)  # Stop monitoring virtual SL
                         escalated_count += 1
                         log(LogLevel.CRITICAL, f"Escalated ticket {ticket} to _FAILED_CLOSE_ bucket after max retries")
 
@@ -339,6 +362,7 @@ def run_signal_cycle():
                     failed_key = ("_FAILED_CLOSE_", key[0], key[2], key[3])
                     positions.remove_ticket(ticket)
                     positions.add_ticket(failed_key, ticket)
+                    virtual_sl.remove_position(ticket)  # Stop monitoring virtual SL
                     escalated_count += 1
                     log(LogLevel.CRITICAL, f"Escalated ticket {ticket} to _FAILED_CLOSE_ bucket after max retries (exception)")
 
@@ -350,6 +374,12 @@ def run_signal_cycle():
 
         for key, count in opened.items():
             pair, side, tp, sl = key
+
+            # CRITICAL: Skip if this position was recently closed by virtual SL
+            # Prevent immediate reopen after bot-triggered close
+            if virtual_sl.is_closed_by_bot(key):
+                log(LogLevel.INFO, f"Skipping {key} - recently closed by virtual SL, waiting for signal reset")
+                continue
 
             # Find matching signal IN FRESH SIGNALS ONLY (< 30 min age)
             # Only open trades from fresh signals, not old ones
@@ -387,6 +417,17 @@ def run_signal_cycle():
 
                     if success and ticket:
                         positions.add_ticket(key, ticket)
+
+                        # Register with virtual SL for spread-aware monitoring
+                        virtual_sl.add_position(
+                            ticket=ticket,
+                            pair=sig.pair,
+                            side=sig.side,
+                            original_sl=sig.sl,
+                            tp=sig.tp,
+                            entry_price=sig.open
+                        )
+
                         open_count += 1
                         print(f"  [OK] Opened ticket {ticket} for {key}")
                         processed_signal_ids.add(sig_id)
@@ -427,6 +468,12 @@ def run_signal_cycle():
 
     log(LogLevel.INFO, f"Cycle complete: {open_count} opened, {close_count} closed, {escalated_count} escalated")
     log(LogLevel.INFO, f"Tracked: {total_tickets} tickets | UNMATCHED: {unmatched_count} | FAILED_CLOSE: {failed_close_count}")
+
+    # Log virtual SL status
+    monitored_count = len(virtual_sl.metadata)
+    closed_by_bot_count = len(virtual_sl.closed_by_bot)
+    if monitored_count > 0 or closed_by_bot_count > 0:
+        log(LogLevel.DEBUG, f"Virtual SL: monitoring {monitored_count} tickets, {closed_by_bot_count} in closed_by_bot")
 
     # Monitor UNMATCHED growth
     safety.check_unmatched_growth(unmatched_count)
