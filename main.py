@@ -236,24 +236,34 @@ def run_signal_cycle():
 
     print(f"  Active: {len(active_signals)}, Close: {len(close_signals)}")
 
-    # Filter ACTIVE by age, keep ALL CLOSE signals
-    active_signals = SignalFilter.filter_by_age(active_signals, MAX_SIGNAL_AGE)
-    print(f"  After age filter: {len(active_signals)} active (max age: {MAX_SIGNAL_AGE}s)")
+    # ──── FILTER BY AGE: Only open NEW trades from fresh signals (<30 min)
+    # But keep ALL active signals for position management (don't close based on age)
+
+    fresh_signals = SignalFilter.filter_by_age(active_signals, MAX_SIGNAL_AGE)
+    print(f"  After age filter: {len(fresh_signals)} fresh active (max age: {MAX_SIGNAL_AGE}s)")
+
+    # For position management, use ALL active signals (age-unfiltered)
+    # This ensures positions stay open even after signals age past 30 min
+    all_active_signals = active_signals
 
     # ──── DEDUPLICATE: Keep most recent per key ──────────────────────────────
 
     # Sort by time DESC so deduplication keeps most recent
-    signals_to_process = sorted(active_signals, key=lambda s: s.time, reverse=True)
+    fresh_signals_sorted = sorted(fresh_signals, key=lambda s: s.time, reverse=True)
+    signals_to_open = SignalFilter.deduplicate_by_key(fresh_signals_sorted)
+    print(f"  After dedup: {len(signals_to_open)} unique fresh signals for opening")
 
-    signals_to_process = SignalFilter.deduplicate_by_key(signals_to_process)
-    print(f"  After dedup: {len(signals_to_process)} unique active signals")
+    # For position management, deduplicate ALL active signals
+    all_active_sorted = sorted(all_active_signals, key=lambda s: s.time, reverse=True)
+    signals_to_manage = SignalFilter.deduplicate_by_key(all_active_sorted)
 
     # ──── BUILD CURRENT STATE ────────────────────────────────────────────────
 
-    # Current keys from website (for state comparison)
+    # Current keys from ALL active signals (for state comparison)
+    # This ensures positions stay open even if signals age past 30 minutes
     curr_keys = [
         SignalKey.build(s.pair, s.side, s.tp, s.sl)
-        for s in signals_to_process
+        for s in signals_to_manage
     ]
 
     # Get previous keys from our tracker
@@ -341,9 +351,10 @@ def run_signal_cycle():
         for key, count in opened.items():
             pair, side, tp, sl = key
 
-            # Find matching signal
+            # Find matching signal IN FRESH SIGNALS ONLY (< 30 min age)
+            # Only open trades from fresh signals, not old ones
             matching_signals = [
-                s for s in signals_to_process
+                s for s in signals_to_open
                 if s.pair == pair and s.side == side
                 and round(s.tp, 3) == round(tp, 3)
                 and round(s.sl, 3) == round(sl, 3)
@@ -491,17 +502,18 @@ try:
             except Exception as e:
                 pass  # Skip malformed
 
-        # Filter: ACTIVE signals only, age, then deduplicate
+        # Filter: ACTIVE signals only
+        # For startup reconstruction, use ALL active signals (no age filter)
+        # This ensures we properly reconstruct ANY open positions regardless of signal age
         active_signals = [s for s in signals if s.status == "ACTIVE"]
-        active_signals = SignalFilter.filter_by_age(active_signals, MAX_SIGNAL_AGE)
-        signals_to_process = sorted(active_signals, key=lambda s: s.time, reverse=True)
-        signals_to_process = SignalFilter.deduplicate_by_key(signals_to_process)
+        signals_for_reconstruction = sorted(active_signals, key=lambda s: s.time, reverse=True)
+        signals_for_reconstruction = SignalFilter.deduplicate_by_key(signals_for_reconstruction)
 
-        if signals_to_process:
+        if signals_for_reconstruction:
             mt5_positions = mt5.positions_get() or []
             if mt5_positions:
                 reconstructed, unmatched = reconstruct_positions_from_mt5(
-                    mt5_positions, signals_to_process, positions
+                    mt5_positions, signals_for_reconstruction, positions
                 )
                 print(f"[STARTUP] Reconstructed {reconstructed} positions, {unmatched} unmatched\n")
             else:
