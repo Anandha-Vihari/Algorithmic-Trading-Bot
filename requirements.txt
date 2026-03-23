@@ -1,4 +1,4 @@
-MetaTrader5==5.0.45
+MetaTrader5==5.0.5640
 beautifulsoup4==4.12.2
 requests==2.31.0
 lxml==4.9.3
