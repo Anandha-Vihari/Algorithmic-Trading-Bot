@@ -543,7 +543,7 @@ def run_signal_cycle():
                             side=sig.side,
                             original_sl=sig.sl,
                             tp=sig.tp,
-                            entry_price=sig.open
+                            entry_price=sig.open_price
                         )
 
                         # Register with trailing stop for SL management
@@ -552,7 +552,7 @@ def run_signal_cycle():
                                 ticket=ticket,
                                 symbol=sig.pair,
                                 side=sig.side,
-                                entry_price=sig.open,
+                                entry_price=sig.open_price,
                                 tp=sig.tp,
                                 original_sl=sig.sl
                             )
