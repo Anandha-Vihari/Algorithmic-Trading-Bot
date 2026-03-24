@@ -281,28 +281,28 @@ class TrailingStopManager:
             # ─── FIX 1: USE REAL ENTRY PRICE FROM MT5 ──────────────────────────
             entry_price = pos.price_open  # NOT stored signal price
 
-            # ─── FIX 2: USE SAFE PROFIT (DYNAMIC NOISE FILTER) ─────────────────
-            # Dynamic buffer based on current spread
+            # ─── FIX 2: USE SAFE PROFIT (NOISE FILTER IN DOLLARS) ────────────────
+            profit = pos.profit  # Real $ from MT5
+            SAFE_PROFIT_BUFFER = 0.10  # Buffer in dollars (covers spread + commission)
+            safe_profit = profit - SAFE_PROFIT_BUFFER  # Remove noise ($ - $ = correct)
+
+            if safe_profit <= 0:
+                continue  # No real profit yet, skip
+
             symbol = meta['symbol']
+            current_sl = pos.sl
+            current_phase = meta['last_phase']
+
+            # Get spread for SL placement buffer (separate from profit filtering)
             tick = mt5_module.symbol_info_tick(symbol)
             if not tick:
                 continue
 
             spread = abs(tick.ask - tick.bid)
-            SAFE_BUFFER = max(spread * 2, 0.10)  # Dynamic: 2x spread or 0.10 minimum
-
-            profit = pos.profit  # Real $ from MT5
-            safe_profit = profit - SAFE_BUFFER  # Remove noise
-
-            if safe_profit <= 0:
-                continue  # No real profit yet, skip
-
-            current_sl = pos.sl
-            current_phase = meta['last_phase']
 
             # ─── RUNTIME TRACE ──────────────────────────────────────────────────
             phase_names = {0: "Entry", 1: "BE", 2: "Lock30c", 3: "Lock50c", 4: "Lock$1"}
-            print(f"[TRAIL$_TRACE] T{ticket} | phase={phase_names[current_phase]} | price={pos.price_current:.5f} | entry={entry_price:.5f} | current_sl={current_sl:.5f} | profit=${profit:.2f} safe=${safe_profit:.2f} buffer=${SAFE_BUFFER:.5f}")
+            print(f"[TRAIL$_TRACE] T{ticket} | phase={phase_names[current_phase]} | price={pos.price_current:.5f} | entry={entry_price:.5f} | current_sl={current_sl:.5f} | profit=${profit:.2f} safe=${safe_profit:.2f} (buffer=${SAFE_PROFIT_BUFFER:.2f})")
 
             # ─── FIX 3: SMOOTH PROFIT THRESHOLDS ─────────────────────────────────
             if safe_profit >= 1.50:
