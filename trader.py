@@ -12,6 +12,11 @@ from datetime import datetime, timezone
 from config import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_EXE, TRADE_VOLUME
 
 MAGIC_NUMBER = 777  # All trades use same magic (no frame distinction in blind mode)
+MAX_RETRIES = 3
+MAX_CLOSE_ATTEMPTS = 5
+
+# Track close attempts per ticket to prevent infinite loops
+close_attempts = {}
 
 
 def init_mt5():
@@ -29,9 +34,31 @@ def init_mt5():
     print("MT5 connected")
 
 
+def get_adaptive_deviation(symbol: str) -> int:
+    """Calculate deviation based on current spread and volatility.
+
+    JPY pairs and volatile symbols get higher deviation.
+    Standard pairs get 50 pips.
+    """
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        return 50  # Default fallback
+
+    # Calculate spread in pips
+    spread = abs(tick.ask - tick.bid)
+
+    # For JPY pairs (smaller pip value), use larger deviation
+    if "JPY" in symbol:
+        return max(100, int(spread * 10000 * 3))  # 3x spread or 100, whichever higher
+
+    # Standard pairs: 50 pips minimum, or 2x spread
+    return max(50, int(spread * 10000 * 2))
+
+
+
 def open_trade(signal):
     """
-    Open a trade exactly as signal says.
+    Open a trade exactly as signal says with retry logic.
 
     Returns: (success: bool, ticket: int or None)
 
@@ -59,7 +86,7 @@ def open_trade(signal):
         print(f"  [SKIP] Symbol {pair} not available")
         return False, None
 
-    # ─── Get current price ───────────────────────────────────────────────
+    # ─── FIX 3: Ensure tick data available ───────────────────────────────
     tick = mt5.symbol_info_tick(pair)
     if tick is None:
         print(f"  [SKIP] No tick data for {pair}")
@@ -67,49 +94,74 @@ def open_trade(signal):
 
     price = tick.ask if side == "BUY" else tick.bid
 
-    # ─── Send order ──────────────────────────────────────────────────────
+    # ─── Send order with retry logic ─────────────────────────────────────
     order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
+    result = None
 
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": pair,
-        "volume": TRADE_VOLUME,
-        "type": order_type,
-        "price": price,
-        "tp": tp,
-        "sl": sl,
-        "deviation": 20,
-        "magic": MAGIC_NUMBER,
-        "comment": "blind",
-        "type_filling": mt5.ORDER_FILLING_IOC,
-        "type_time": mt5.ORDER_TIME_GTC
-    }
+    for attempt in range(MAX_RETRIES):
+        # FIX 6: Calculate adaptive deviation based on spread
+        deviation = get_adaptive_deviation(pair)
 
-    result = mt5.order_send(request)
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": pair,
+            "volume": TRADE_VOLUME,
+            "type": order_type,
+            "price": price,
+            "tp": tp,
+            "sl": sl,
+            "deviation": deviation,
+            "magic": MAGIC_NUMBER,
+            "comment": "blind",
+            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_time": mt5.ORDER_TIME_GTC
+        }
 
-    if result.retcode == 10009:
-        actual_price = result.price
-        signal_price = signal.open_price
-        price_diff = abs(actual_price - signal_price)
+        result = mt5.order_send(request)
 
-        if price_diff > 0.0001:
-            print(f"  [OPENED] {side} {pair} → Actual: {actual_price} (Signal: {signal_price}) | SL: {sl} | TP: {tp} | Ticket: {result.order}")
+        # FIX 5: Log MT5 errors properly
+        if result:
+            print(f"  [MT5] Attempt {attempt+1}: retcode={result.retcode} comment={result.comment}")
+
+        # Success - break loop
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            print(f"  [OPENED] {side} {pair} @ {result.price} | SL: {sl} | TP: {tp} | Ticket: {result.order} | Deviation: {deviation}")
+            return True, result.order
+
+        # Price moved - try again with fresh price
+        if result and result.retcode == 10016:  # Price moved
+            if attempt < MAX_RETRIES - 1:
+                print(f"  [RETRY] Price moved (attempt {attempt+1}/{MAX_RETRIES}), refreshing...")
+                tick = mt5.symbol_info_tick(pair)
+                if tick:
+                    price = tick.ask if side == "BUY" else tick.bid
+                time.sleep(0.2)
+            else:
+                print(f"  [FAIL] Price moved after {MAX_RETRIES} retries - skipping")
+                return True, None  # Mark as processed
         else:
-            print(f"  [OPENED] {side} {pair} @ {result.price} | SL: {sl} | TP: {tp} | Ticket: {result.order}")
-        return True, result.order
-    elif result.retcode == 10016:
-        print(f"  [SKIP] Price moved, invalid stops")
-        return True, None  # Mark as processed
-    else:
-        print(f"  [FAILED] Order rejected: {result.retcode}")
-        return False, None
+            # Other errors - don't retry
+            if result:
+                print(f"  [FAILED] Order rejected: retcode={result.retcode} comment={result.comment}")
+            else:
+                print(f"  [FAILED] Order send returned None")
+            return False, None
+
+    return False, None
+
 
 
 def close_trade(pair):
-    """Close all positions for this pair."""
+    """Close all positions for this pair with tick data check and retry logic."""
 
     closed_count = 0
     for name in (pair, pair + "+"):
+        # FIX 3: Ensure tick data available before closing
+        tick = mt5.symbol_info_tick(name)
+        if tick is None:
+            print(f"  [SKIP] No tick data for {name} - cannot close")
+            continue
+
         positions = mt5.positions_get(symbol=name)
         if not positions:
             continue
@@ -118,8 +170,23 @@ def close_trade(pair):
             if pos.magic != MAGIC_NUMBER:
                 continue
 
-            entry_price = pos.price_open
             ticket = pos.ticket
+            entry_price = pos.price_open
+
+            # FIX 4: Track close attempts
+            if ticket not in close_attempts:
+                close_attempts[ticket] = 0
+            close_attempts[ticket] += 1
+
+            # If exceeded max attempts, give up and remove from tracking
+            if close_attempts[ticket] > MAX_CLOSE_ATTEMPTS:
+                print(f"  [FORCE CLOSE] T{ticket} exceeded max close attempts ({MAX_CLOSE_ATTEMPTS}) - removing from tracking")
+                if ticket in close_attempts:
+                    del close_attempts[ticket]
+                continue
+
+            # FIX 6: Use adaptive deviation
+            deviation = get_adaptive_deviation(name)
 
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
@@ -127,7 +194,7 @@ def close_trade(pair):
                 "volume": pos.volume,
                 "type": mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY,
                 "position": pos.ticket,
-                "deviation": 20,
+                "deviation": deviation,
                 "magic": MAGIC_NUMBER,
                 "comment": "close",
                 "type_filling": mt5.ORDER_FILLING_IOC,
@@ -135,7 +202,12 @@ def close_trade(pair):
             }
 
             result = mt5.order_send(request)
-            if result.retcode == 10009:
+
+            # FIX 5: Log MT5 errors properly
+            if result:
+                print(f"  [MT5] Close attempt {close_attempts[ticket]}: retcode={result.retcode} comment={result.comment}")
+
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                 # Fetch real close price from deal history
                 close_deal = None
                 try:
@@ -155,13 +227,21 @@ def close_trade(pair):
                     print(f"  [CLOSED] {name} T{ticket} Entry: {entry_price} -> Close: {close_price} | Diff: {price_diff:.6f} | Profit: ${close_profit:.2f}")
                 else:
                     print(f"  [CLOSED] {name} | Profit: ${pos.profit:.2f}")
+
                 closed_count += 1
+                # Clear close attempt counter on success
+                if ticket in close_attempts:
+                    del close_attempts[ticket]
+            elif result and result.retcode == 10016:
+                # Price moved - will retry next cycle
+                print(f"  [RETRY] Close price moved for T{ticket}")
 
     return closed_count > 0
 
 
+
 def close_position_by_ticket(ticket, pair=None):
-    """Close a specific position by ticket number."""
+    """Close a specific position by ticket number with retry logic and tick checks."""
 
     # ──── EXECUTION TRACE ────
     import traceback
@@ -180,8 +260,21 @@ def close_position_by_ticket(ticket, pair=None):
 
     print(f"[TRACE_CLOSE] Ticket {ticket} close initiated")
     print(f"[TRACE_CLOSE] Caller: {caller_function}() at {caller_frame.filename.split(chr(92))[-1] if caller_frame else 'unknown'}:{caller_frame.lineno if caller_frame else '?'}")
+
+    # FIX 4: Track close attempts per ticket
+    if ticket not in close_attempts:
+        close_attempts[ticket] = 0
+    close_attempts[ticket] += 1
+
+    # If exceeded max attempts, give up
+    if close_attempts[ticket] > MAX_CLOSE_ATTEMPTS:
+        print(f"[FORCE CLOSE] Ticket {ticket} exceeded max close attempts ({MAX_CLOSE_ATTEMPTS}) - removing from tracking")
+        if ticket in close_attempts:
+            del close_attempts[ticket]
+        return False
+
     if ticket in [1029131995, 1028771560, 1028924631]:  # Known problem tickets
-        print(f"[TRACE_CLOSE] **PROBLEM TICKET DETECTED**")
+        print(f"[TRACE_CLOSE] **PROBLEM TICKET DETECTED** (attempt {close_attempts[ticket]}/{MAX_CLOSE_ATTEMPTS})")
 
     names = [(pair, pair + "+")] if pair else [(None, None)]
 
@@ -189,6 +282,13 @@ def close_position_by_ticket(ticket, pair=None):
         for name in (name1, name2):
             if name is None:
                 continue
+
+            # FIX 3: Ensure tick data available before closing
+            tick = mt5.symbol_info_tick(name)
+            if tick is None:
+                print(f"  [SKIP] No tick data for {name} - cannot close T{ticket}")
+                continue
+
             positions = mt5.positions_get(symbol=name)
             if not positions:
                 continue
@@ -202,9 +302,11 @@ def close_position_by_ticket(ticket, pair=None):
                 entry_time = datetime.now(timezone.utc)
 
                 # Get tick info before close
-                tick = mt5.symbol_info_tick(name)
                 bid_before = tick.bid if tick else 0
                 ask_before = tick.ask if tick else 0
+
+                # FIX 6: Use adaptive deviation
+                deviation = get_adaptive_deviation(name)
 
                 request = {
                     "action": mt5.TRADE_ACTION_DEAL,
@@ -212,7 +314,7 @@ def close_position_by_ticket(ticket, pair=None):
                     "volume": pos.volume,
                     "type": mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY,
                     "position": ticket,
-                    "deviation": 20,
+                    "deviation": deviation,
                     "magic": MAGIC_NUMBER,
                     "comment": "close",
                     "type_filling": mt5.ORDER_FILLING_IOC,
@@ -220,7 +322,12 @@ def close_position_by_ticket(ticket, pair=None):
                 }
 
                 result = mt5.order_send(request)
-                if result.retcode == 10009:
+
+                # FIX 5: Log MT5 errors properly
+                if result:
+                    print(f"  [MT5] Close attempt {close_attempts[ticket]}: retcode={result.retcode} comment={result.comment}")
+
+                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                     # Close succeeded - fetch real close price from deal history
                     close_deal = None
                     try:
@@ -270,10 +377,19 @@ def close_position_by_ticket(ticket, pair=None):
                     else:
                         print(f"    [OK] Position T{ticket} fully closed in MT5")
 
+                    # Clear close attempt counter on success
+                    if ticket in close_attempts:
+                        del close_attempts[ticket]
+
                     return True
+                elif result and result.retcode == 10016:
+                    # Price moved - will retry next cycle
+                    print(f"  [RETRY] Close price moved for T{ticket}, will retry")
+                    return False
 
     print(f"  [WARN] Position ticket {ticket} not found")
     return False
+
 
 
 def get_position(pair):
