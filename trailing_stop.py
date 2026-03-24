@@ -243,6 +243,17 @@ class TrailingStopManager:
     def update_all_positions(self, mt5_module):
         """Update trailing stops for all tracked positions using ACTUAL profit from MT5.
 
+        PRODUCTION-SAFE with 9 critical fixes:
+        1. Real entry price from MT5 (pos.price_open)
+        2. Safe profit with noise filter (profit - 0.20 buffer)
+        3. Calibrated thresholds (0.40, 0.80, 1.20, 1.80)
+        4. Stable profit → price conversion
+        5. Calculate new SL
+        6. Spread-aware buffer
+        7. Prevent backward SL
+        8. Clamp over-aggressive moves
+        9. Apply SL with logging
+
         MUST be called every cycle in main loop:
           1. check_virtual_sl_and_close()
           2. update_all_positions(mt5)        # <-- HERE
@@ -251,11 +262,13 @@ class TrailingStopManager:
         Args:
             mt5_module: MetaTrader5 module reference
         """
-        # FIX 1: RECONCILIATION - Remove stale tickets at START of every cycle
+        # RECONCILIATION - Remove stale tickets at START of every cycle
         self.reconcile_with_mt5(mt5_module)
 
         if not self.position_meta:
             return
+
+        SAFE_BUFFER = 0.20  # Buffer covers spread + commission
 
         for ticket in list(self.position_meta.keys()):
             meta = self.position_meta[ticket]
@@ -266,50 +279,132 @@ class TrailingStopManager:
                 continue
 
             pos = positions[0]
-            profit = pos.profit  # ACTUAL profit in $ from MT5
 
+            # ─── FIX 1: USE REAL ENTRY PRICE FROM MT5 ──────────────────────────
+            entry_price = pos.price_open  # NOT stored signal price
+
+            # ─── FIX 2: USE SAFE PROFIT (NOISE FILTER) ──────────────────────────
+            profit = pos.profit  # Real $ from MT5
+            safe_profit = profit - SAFE_BUFFER  # Remove noise
+
+            if safe_profit <= 0:
+                continue  # No real profit yet, skip
+
+            symbol = meta['symbol']
             current_sl = pos.sl
             current_phase = meta['last_phase']
-            entry = meta['entry']
-            symbol = meta['symbol']
-            side = meta['side']
 
-            # ─── RUNTIME TRACE ──────────────────────────────────────────────
+            # ─── RUNTIME TRACE ──────────────────────────────────────────────────
             phase_names = {0: "Entry", 1: "BE", 2: "Lock30c", 3: "Lock50c", 4: "Lock$1"}
-            print(f"[TRAIL$_TRACE] T{ticket} | phase={phase_names[current_phase]} | price={pos.price_current:.5f} | entry={entry:.5f} | current_sl={current_sl:.5f} | profit=${profit:.2f} | side={side}")
+            print(f"[TRAIL$_TRACE] T{ticket} | phase={phase_names[current_phase]} | price={pos.price_current:.5f} | entry={entry_price:.5f} | current_sl={current_sl:.5f} | profit=${profit:.2f} safe=${safe_profit:.2f}")
 
-            # ─── PHASE THRESHOLDS (DOLLAR-BASED) ────────────────────────────
-            # Phase 0 → 1: Break even at $0.30 profit
-            if profit >= 0.30 and current_phase == 0:
-                new_sl = self._calculate_new_sl_from_profit(entry, 0.00, symbol, side)
-                if new_sl is not None:
-                    new_sl = self._clamp_sl_for_symbol(new_sl, symbol, side)
-                    print(f"[TRAIL$_PHASE] T{ticket} | phase 0 -> 1 | profit=${profit:.2f} (>=$0.30) | lock=$0.00 (breakeven) | SL: {current_sl:.5f} -> {new_sl:.5f}")
-                    self._transition_phase(ticket, 0, 1, new_sl, f"Breakeven at ${profit:.2f}")
+            # ─── FIX 3: CALIBRATED PROFIT THRESHOLDS ────────────────────────────
+            if safe_profit >= 1.80:
+                lock_profit = 1.00
+                target_phase = 4
+                threshold = 1.80
+            elif safe_profit >= 1.20:
+                lock_profit = 0.50
+                target_phase = 3
+                threshold = 1.20
+            elif safe_profit >= 0.80:
+                lock_profit = 0.30
+                target_phase = 2
+                threshold = 0.80
+            elif safe_profit >= 0.40:
+                lock_profit = 0.00  # Breakeven
+                target_phase = 1
+                threshold = 0.40
+            else:
+                continue  # Not enough profit
 
-            # Phase 1 → 2: Lock $0.30 profit at $0.60 actual profit
-            elif profit >= 0.60 and current_phase <= 1:
-                new_sl = self._calculate_new_sl_from_profit(entry, 0.30, symbol, side)
-                if new_sl is not None:
-                    new_sl = self._clamp_sl_for_symbol(new_sl, symbol, side)
-                    print(f"[TRAIL$_PHASE] T{ticket} | phase {current_phase} -> 2 | profit=${profit:.2f} (>=$0.60) | lock=$0.30 | SL: {current_sl:.5f} -> {new_sl:.5f}")
-                    self._transition_phase(ticket, current_phase, 2, new_sl, f"Lock $0.30 at ${profit:.2f}")
+            # Skip if already in target phase
+            if current_phase >= target_phase:
+                continue
 
-            # Phase 2 → 3: Lock $0.50 profit at $1.00 actual profit
-            elif profit >= 1.00 and current_phase <= 2:
-                new_sl = self._calculate_new_sl_from_profit(entry, 0.50, symbol, side)
-                if new_sl is not None:
-                    new_sl = self._clamp_sl_for_symbol(new_sl, symbol, side)
-                    print(f"[TRAIL$_PHASE] T{ticket} | phase {current_phase} -> 3 | profit=${profit:.2f} (>=$1.00) | lock=$0.50 | SL: {current_sl:.5f} -> {new_sl:.5f}")
-                    self._transition_phase(ticket, current_phase, 3, new_sl, f"Lock $0.50 at ${profit:.2f}")
+            # ─── FIX 4: STABLE PROFIT → PRICE CONVERSION ────────────────────────
+            try:
+                symbol_info = mt5_module.symbol_info(symbol)
+                if not symbol_info:
+                    print(f"[TRAIL_ERR] T{ticket} Symbol info unavailable for {symbol}")
+                    continue
 
-            # Phase 3 → 4: Lock $1.00 profit at $1.50 actual profit
-            elif profit >= 1.50 and current_phase <= 3:
-                new_sl = self._calculate_new_sl_from_profit(entry, 1.00, symbol, side)
-                if new_sl is not None:
-                    new_sl = self._clamp_sl_for_symbol(new_sl, symbol, side)
-                    print(f"[TRAIL$_PHASE] T{ticket} | phase {current_phase} -> 4 | profit=${profit:.2f} (>=$1.50) | lock=$1.00 | SL: {current_sl:.5f} -> {new_sl:.5f}")
-                    self._transition_phase(ticket, current_phase, 4, new_sl, f"Lock $1.00 at ${profit:.2f}")
+                tick_value = symbol_info.trade_tick_value
+                tick_size = symbol_info.trade_tick_size
+
+                if tick_value == 0 or tick_size == 0:
+                    print(f"[TRAIL_ERR] T{ticket} Invalid tick data (value={tick_value}, size={tick_size})")
+                    continue
+
+                value_per_price = tick_value / tick_size
+                if value_per_price == 0:
+                    print(f"[TRAIL_ERR] T{ticket} Zero value_per_price")
+                    continue
+
+                # ─── FIX 5: CALCULATE NEW SL ────────────────────────────────────
+                price_move = lock_profit / value_per_price
+
+                if pos.type == mt5_module.POSITION_TYPE_BUY:
+                    new_sl = entry_price + price_move
+                else:  # SELL
+                    new_sl = entry_price - price_move
+
+                # ─── FIX 6: ADD SPREAD BUFFER ───────────────────────────────────
+                tick = mt5_module.symbol_info_tick(symbol)
+                if tick:
+                    spread = abs(tick.ask - tick.bid)
+                    buffer = max(spread * 2, 0.0001)
+
+                    if pos.type == mt5_module.POSITION_TYPE_BUY:
+                        new_sl -= buffer
+                    else:
+                        new_sl += buffer
+                else:
+                    print(f"[TRAIL_ERR] T{ticket} No tick data for spread buffer")
+                    continue
+
+                # ─── FIX 7: PREVENT BACKWARD SL ─────────────────────────────────
+                if pos.type == mt5_module.POSITION_TYPE_BUY:
+                    if new_sl <= current_sl:
+                        continue  # Would move backward, skip
+                else:  # SELL
+                    if new_sl >= current_sl:
+                        continue  # Would move backward, skip
+
+                # ─── FIX 8: CLAMP OVER-AGGRESSIVE MOVES ──────────────────────────
+                current_price = pos.price_current
+                max_allowed = abs(current_price - entry_price) * 0.8
+
+                if abs(new_sl - entry_price) > max_allowed:
+                    print(f"[TRAIL_SKIP] T{ticket} SL too aggressive (max_allowed={max_allowed:.5f})")
+                    continue
+
+                # ─── FIX 9: APPLY SL UPDATE ─────────────────────────────────────
+                request = {
+                    "action": mt5_module.TRADE_ACTION_SLTP,
+                    "position": ticket,
+                    "sl": new_sl,
+                    "tp": pos.tp
+                }
+
+                result = mt5_module.order_send(request)
+
+                if result and result.retcode == mt5_module.TRADE_RETCODE_DONE:
+                    # Update phase
+                    self.position_meta[ticket]['last_phase'] = target_phase
+                    self.phase_change_log[ticket] = datetime.now(timezone.utc).isoformat()
+
+                    # Log success
+                    phase_names_full = {0: "Entry", 1: "BE", 2: "Lock30c", 3: "Lock50c", 4: "Lock$1"}
+                    print(f"[TRAIL$] T{ticket} | {phase_names_full[current_phase]}→{phase_names_full[target_phase]} | profit=${profit:.2f} safe=${safe_profit:.2f} threshold=${threshold:.2f} lock=${lock_profit:.2f} | SL {current_sl:.5f}→{new_sl:.5f}")
+                else:
+                    retcode = result.retcode if result else 'None'
+                    print(f"[TRAIL_ERR] T{ticket} SL update failed: retcode={retcode}")
+
+            except Exception as e:
+                print(f"[TRAIL_ERR] T{ticket} Exception: {e}")
+                continue
+
 
 
 def init_trailing_stop():
