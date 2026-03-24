@@ -102,6 +102,27 @@ def validate_and_adjust_stops(symbol, side, price, tp, sl):
 
 
 def get_adaptive_deviation(symbol: str) -> int:
+    """
+    Calculate adaptive deviation based on symbol volatility.
+    JPY pairs: max(100, 3x spread)
+    Standard pairs: max(50, 2x spread)
+    """
+    try:
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return 100  # Safe default
+
+        spread_points = int((tick.ask - tick.bid) / mt5.symbol_info(symbol).point)
+
+        if "JPY" in symbol:
+            return max(100, spread_points * 3)
+        else:
+            return max(50, spread_points * 2)
+    except Exception as e:
+        print(f"  [DEVIATION] Error calculating deviation for {symbol}: {e}")
+        return 100  # Safe default
+
+
 def open_trade(signal):
     """
     Open a trade exactly as signal says with retry logic.
