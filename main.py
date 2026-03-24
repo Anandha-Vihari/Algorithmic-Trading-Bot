@@ -251,15 +251,15 @@ def run_signal_cycle():
 
     print(f"  Active: {len(active_signals)}, Close: {len(close_signals)}")
 
-    # ──── FILTER BY AGE: Only open NEW trades from fresh signals (<30 min)
-    # But keep ALL active signals for position management (don't close based on age)
+    # ──── FILTER BY AGE: Only use fresh signals < 30 min old ──────────────────
+    # Age filter applies to BOTH opening new trades AND position management
 
     fresh_signals = SignalFilter.filter_by_age(active_signals, MAX_SIGNAL_AGE)
     print(f"  After age filter: {len(fresh_signals)} fresh active (max age: {MAX_SIGNAL_AGE}s)")
 
-    # For position management, use ALL active signals (age-unfiltered)
-    # This ensures positions stay open even after signals age past 30 min
-    all_active_signals = active_signals
+    # For position management, also use age-filtered signals
+    # Signals older than 30 minutes are ignored for both opening and closing
+    all_active_signals = fresh_signals
 
     # ──── DEDUPLICATE: Keep most recent per key ──────────────────────────────
 
@@ -306,14 +306,11 @@ def run_signal_cycle():
     if curr_keys:
         print(f"  [VERIFY] Sample curr_keys (first 3): {curr_keys[:3]}")
 
-    # CRITICAL CHECK: If curr_keys == signals_to_open length, age filter is NOT being applied (BUG)
+    # CRITICAL CHECK: Verify age filter is being applied correctly to both opening and closing
     if len(curr_keys) == len(signals_to_open):
-        print(f"  [BUG DETECTED!] curr_keys has FRESH signal count! (should be ALL active)")
-        print(f"  Expected: {len(signals_to_manage)}, Got: {len(curr_keys)}")
-    elif len(curr_keys) == len(signals_to_manage):
-        print(f"  [VERIFIED OK] curr_keys built from ALL active signals (age filter NOT applied to closing)")
-    else:
-        print(f"  [WARNING] Unexpected curr_keys count mismatch")
+        print(f"  [VERIFIED OK] Age filter applied to both opening and closing")
+    elif len(curr_keys) != len(signals_to_open):
+        print(f"  [WARNING] curr_keys mismatch: {len(curr_keys)} != {len(signals_to_open)}")
 
     # MIXED SCENARIO DETECTION
     if len(active_signals) >= 5 and 0 < len(fresh_signals) < len(active_signals):
@@ -345,7 +342,7 @@ def run_signal_cycle():
                 )
                 print(f"      In raw active: {key_in_active} | In fresh: {key_in_fresh}")
                 if key_in_active and not key_in_fresh:
-                    print(f"      REASON: Signal was aged-out by filter (BUG IF THIS HAPPENS)")
+                    print(f"      REASON: Signal was aged-out by age filter (expected behavior)")
 
         if missing_from_prev:
             print(f"\n  [INFO] Keys in curr but NOT in prev (NEW): {missing_from_prev}")
