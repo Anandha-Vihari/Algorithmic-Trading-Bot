@@ -504,10 +504,10 @@ def run_signal_cycle():
                 log(LogLevel.INFO, f"Skipping {key} - recently closed by virtual SL, waiting for signal reset")
                 continue
 
-            # Find matching signal from ALL active signals (not just fresh)
-            # Opened keys come from ALL signals, need to search there
+            # Find matching signal from FRESH signals only
+            # Only open signals that passed the age filter (< 30 min)
             matching_signals = [
-                s for s in signals_to_manage
+                s for s in signals_to_open
                 if s.pair == pair and s.side == side
                 and round(s.tp, 3) == round(tp, 3)
                 and round(s.sl, 3) == round(sl, 3)

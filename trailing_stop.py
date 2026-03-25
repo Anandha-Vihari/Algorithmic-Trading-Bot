@@ -59,6 +59,8 @@ class TrailingStopManager:
             'side': side,
             'last_phase': 0,
         }
+        # DEBUG: Print immediately to stdout
+        print(f"[TRAIL$_REGISTER] T{ticket} {symbol} {side} | Entry: {entry_price:.5f} | TP: {tp:.5f} | SL: {original_sl:.5f}")
         log(LogLevel.DEBUG, f"[TRAIL] Registered T{ticket} {symbol} {side} | Entry: {entry_price} | TP: {tp}")
 
     def remove_position(self, ticket: int):
@@ -265,8 +267,12 @@ class TrailingStopManager:
         # RECONCILIATION - Remove stale tickets at START of every cycle
         self.reconcile_with_mt5(mt5_module)
 
+        # DEBUG: Always log how many positions we're tracking
         if not self.position_meta:
+            print(f"[TRAIL$_DEBUG] No positions tracked (position_meta empty)")
             return
+
+        print(f"[TRAIL$_DEBUG] Processing {len(self.position_meta)} tracked position(s)")
 
         for ticket in list(self.position_meta.keys()):
             meta = self.position_meta[ticket]
