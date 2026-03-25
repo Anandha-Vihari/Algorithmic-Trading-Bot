@@ -364,26 +364,48 @@ class TrailingStopManager:
             signal_sl = meta['original_sl']  # From website signal provider
 
             # ─── STEP 2: CALCULATE MAX LOSS SL (ALWAYS ACTIVE) ───────────────────
+            # Use stable symbol properties, NOT profit-dependent ratio
             loss_cap = 0.70  # dollars - hard cap, never lose more than this
 
-            # Price movement per dollar of profit/loss
-            price_per_dollar = abs(current_price - entry_price) / abs(profit)
+            try:
+                symbol_info = mt5_module.symbol_info(symbol)
+                if not symbol_info:
+                    print(f"[TRAIL_ERR] T{ticket} Symbol info unavailable for {symbol}")
+                    continue
 
-            # Convert loss cap to price movement
-            loss_offset = loss_cap * price_per_dollar
+                tick_value = symbol_info.trade_tick_value
+                tick_size = symbol_info.trade_tick_size
 
-            # Calculate max loss SL
-            if pos.type == mt5_module.POSITION_TYPE_BUY:
-                max_loss_sl = entry_price - loss_offset  # Below entry for BUY
-            else:  # SELL
-                max_loss_sl = entry_price + loss_offset  # Above entry for SELL
+                if tick_size == 0:
+                    print(f"[TRAIL_ERR] T{ticket} Invalid tick_size for {symbol}")
+                    continue
+
+                # Stable conversion: dollars per unit of price movement
+                dollar_per_price = tick_value / tick_size
+
+                # Convert loss cap to price movement
+                price_offset = loss_cap / dollar_per_price
+
+                # Calculate max loss SL
+                if pos.type == mt5_module.POSITION_TYPE_BUY:
+                    max_loss_sl = entry_price - price_offset  # Below entry for BUY
+                else:  # SELL
+                    max_loss_sl = entry_price + price_offset  # Above entry for SELL
+
+            except Exception as e:
+                print(f"[TRAIL_ERR] T{ticket} Exception calculating max_loss_sl: {e}")
+                continue
 
             # ─── STEP 3: CALCULATE TRAILING SL (SELECTIVE - Only if profit >= $0.30) ───
+            # For trailing SL, use profit-based price_per_dollar (adaptive to position size)
             trailing_sl = None  # Initialize to None
             target_phase = current_phase  # Track for logging
             lock_profit = None
 
             if profit >= 0.30:
+                # Dynamic ratio for trailing (responds to actual profit)
+                price_per_dollar = abs(current_price - entry_price) / abs(profit)
+
                 # Only calculate trailing if profit threshold reached
                 if profit >= 1.50:
                     lock_profit = 1.00
