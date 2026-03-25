@@ -435,11 +435,17 @@ class TrailingStopManager:
             if trailing_sl is not None:
                 candidates.append(trailing_sl)
 
+            # DEBUG: Log all candidates before selection
+            trailing_str = f"{trailing_sl:.5f}" if trailing_sl is not None else "N/A"
+            print(f"[SL_CAND] T{ticket} | signal={signal_sl:.5f} | max_loss={max_loss_sl:.5f} | trailing={trailing_str}")
+
             # Pick safest SL based on position side
             if pos.type == mt5_module.POSITION_TYPE_BUY:
                 final_sl = max(candidates)  # Highest = tightest below price
             else:  # SELL
                 final_sl = min(candidates)  # Lowest = tightest above price
+
+            print(f"[SL_SELECT] T{ticket} | Candidates: {[f'{c:.5f}' for c in candidates]} | Selected: {final_sl:.5f}")
 
             # ─── STEP 5: PREVENT BACKWARD SL (MONOTONIC) ────────────────────────
             if pos.type == mt5_module.POSITION_TYPE_BUY:
