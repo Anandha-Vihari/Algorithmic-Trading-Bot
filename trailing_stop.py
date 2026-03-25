@@ -430,14 +430,43 @@ class TrailingStopManager:
                         trailing_sl = entry_price - price_move
 
             # ─── STEP 4: UNIFIED SL DECISION (Pick safest/tightest SL) ─────────────────
-            # Collect all candidate SL values
-            candidates = [signal_sl, max_loss_sl]
-            if trailing_sl is not None:
-                candidates.append(trailing_sl)
+            # Collect all candidate SL values - MUST validate side before using
+            candidates = []
 
-            # DEBUG: Log all candidates before selection
+            # Add signal_sl if it's on the correct side
+            if pos.type == mt5_module.POSITION_TYPE_BUY:
+                if signal_sl < current_price:  # BUY: SL must be below price
+                    candidates.append(signal_sl)
+            else:  # SELL
+                if signal_sl > current_price:  # SELL: SL must be above price
+                    candidates.append(signal_sl)
+
+            # Add max_loss_sl if it's on the correct side
+            if pos.type == mt5_module.POSITION_TYPE_BUY:
+                if max_loss_sl < current_price:  # BUY: SL must be below price
+                    candidates.append(max_loss_sl)
+            else:  # SELL
+                if max_loss_sl > current_price:  # SELL: SL must be above price
+                    candidates.append(max_loss_sl)
+
+            # Add trailing_sl if calculated and on correct side
+            if trailing_sl is not None:
+                if pos.type == mt5_module.POSITION_TYPE_BUY:
+                    if trailing_sl < current_price:  # BUY: SL must be below price
+                        candidates.append(trailing_sl)
+                else:  # SELL
+                    if trailing_sl > current_price:  # SELL: SL must be above price
+                        candidates.append(trailing_sl)
+
+            # DEBUG: Log all candidates after validation
             trailing_str = f"{trailing_sl:.5f}" if trailing_sl is not None else "N/A"
-            print(f"[SL_CAND] T{ticket} | signal={signal_sl:.5f} | max_loss={max_loss_sl:.5f} | trailing={trailing_str}")
+            print(f"[SL_CAND] T{ticket} | signal={signal_sl:.5f} | max_loss={max_loss_sl:.5f} | trailing={trailing_str} | price={current_price:.5f}")
+            print(f"[SL_VALID] T{ticket} | Valid candidates after side check: {[f'{c:.5f}' for c in candidates]}")
+
+            # If no valid candidates, skip this position
+            if not candidates:
+                print(f"[TRAIL_SKIP] T{ticket} No valid SL candidates after side validation - skipping")
+                continue
 
             # Pick safest SL based on position side
             if pos.type == mt5_module.POSITION_TYPE_BUY:
@@ -445,7 +474,7 @@ class TrailingStopManager:
             else:  # SELL
                 final_sl = min(candidates)  # Lowest = tightest above price
 
-            print(f"[SL_SELECT] T{ticket} | Candidates: {[f'{c:.5f}' for c in candidates]} | Selected: {final_sl:.5f}")
+            print(f"[SL_SELECT] T{ticket} | Final SL: {final_sl:.5f}")
 
             # ─── STEP 5: PREVENT BACKWARD SL (MONOTONIC) ────────────────────────
             if pos.type == mt5_module.POSITION_TYPE_BUY:
