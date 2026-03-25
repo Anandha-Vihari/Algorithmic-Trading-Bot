@@ -59,6 +59,8 @@ class TrailingStopManager:
             'side': side,
             'last_phase': 0,
         }
+        # DEBUG: Print immediately to stdout
+        print(f"[TRAIL$_REGISTER] T{ticket} {symbol} {side} | Entry: {entry_price:.5f} | TP: {tp:.5f} | SL: {original_sl:.5f}")
         log(LogLevel.DEBUG, f"[TRAIL] Registered T{ticket} {symbol} {side} | Entry: {entry_price} | TP: {tp}")
 
     def remove_position(self, ticket: int):
@@ -265,8 +267,12 @@ class TrailingStopManager:
         # RECONCILIATION - Remove stale tickets at START of every cycle
         self.reconcile_with_mt5(mt5_module)
 
+        # DEBUG: Always log how many positions we're tracking
         if not self.position_meta:
+            print(f"[TRAIL$_DEBUG] No positions tracked (position_meta empty)")
             return
+
+        print(f"[TRAIL$_DEBUG] Processing {len(self.position_meta)} tracked position(s)")
 
         for ticket in list(self.position_meta.keys()):
             meta = self.position_meta[ticket]
@@ -301,20 +307,24 @@ class TrailingStopManager:
             spread = abs(tick.ask - tick.bid)
 
             # ─── RUNTIME TRACE ──────────────────────────────────────────────────
-            phase_names = {0: "Entry", 1: "BE", 2: "Lock20c", 3: "Lock30c"}
+            phase_names = {0: "Entry", 1: "BE", 2: "Lock30c", 3: "Lock50c", 4: "Lock$1"}
             print(f"[TRAIL$_TRACE] T{ticket} | phase={phase_names[current_phase]} | price={pos.price_current:.5f} | entry={entry_price:.5f} | current_sl={current_sl:.5f} | profit=${profit:.2f} safe=${safe_profit:.2f} (buffer=${SAFE_PROFIT_BUFFER:.2f})")
 
-            # ─── FIX 3: PROFIT THRESHOLDS (USER SPEC) ─────────────────────────────
-            if safe_profit >= 0.60:
-                lock_profit = 0.30  # Lock $0.30 at $0.60 profit
+            # ─── FIX 3: SMOOTH PROFIT THRESHOLDS ─────────────────────────────────
+            if safe_profit >= 1.50:
+                lock_profit = 1.00
+                target_phase = 4
+                threshold = 1.50
+            elif safe_profit >= 1.00:
+                lock_profit = 0.50
                 target_phase = 3
-                threshold = 0.60
-            elif safe_profit >= 0.40:
-                lock_profit = 0.20  # Lock $0.20 at $0.40 profit
+                threshold = 1.00
+            elif safe_profit >= 0.60:
+                lock_profit = 0.30
                 target_phase = 2
-                threshold = 0.40
+                threshold = 0.60
             elif safe_profit >= 0.30:
-                lock_profit = 0.00  # Breakeven at $0.30 profit
+                lock_profit = 0.00  # Breakeven
                 target_phase = 1
                 threshold = 0.30
             else:
@@ -410,7 +420,7 @@ class TrailingStopManager:
                     self.phase_change_log[ticket] = datetime.now(timezone.utc).isoformat()
 
                     # Log success
-                    phase_names_full = {0: "Entry", 1: "BE", 2: "Lock20c", 3: "Lock30c"}
+                    phase_names_full = {0: "Entry", 1: "BE", 2: "Lock30c", 3: "Lock50c", 4: "Lock$1"}
                     print(f"[TRAIL$] T{ticket} | {phase_names_full[current_phase]}→{phase_names_full[target_phase]} | profit=${profit:.2f} safe=${safe_profit:.2f} threshold=${threshold:.2f} lock=${lock_profit:.2f} | SL {current_sl:.5f}→{new_sl:.5f}")
                 else:
                     retcode = result.retcode if result else 'None'
