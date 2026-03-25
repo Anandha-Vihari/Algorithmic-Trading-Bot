@@ -1,20 +1,26 @@
+"""
+SIMPLE TRADER - Blind follower
+
+Just opens and closes trades as website signals say.
+No fancy position management.
+"""
+
 import time
 import subprocess
 import MetaTrader5 as mt5
-from collections import deque
-from datetime import datetime, timedelta, timezone
-from config import *
-from slog import slog
+from datetime import datetime, timezone
+from config import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_EXE, TRADE_VOLUME
 
-MAGIC_BY_FRAME = {"short": MAGIC_SHORT, "long": MAGIC_LONG}
+MAGIC_NUMBER = 777  # All trades use same magic (no frame distinction in blind mode)
+MAX_RETRIES = 3
+MAX_CLOSE_ATTEMPTS = 5
 
-_peak_profit    = {}   # ticket → highest profit (USD) seen while trade was open
-_profit_history = {}   # ticket → deque of (timestamp, profit) — rolling window for rapid-drop detection
-_tp_extended    = set()  # tickets where TP was already pushed out
+# Track close attempts per ticket to prevent infinite loops
+close_attempts = {}
 
 
 def init_mt5():
-
+    """Initialize MetaTrader5."""
     if not mt5.initialize():
         print("MT5 not running — launching terminal...")
         subprocess.Popen(MT5_EXE, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -28,687 +34,468 @@ def init_mt5():
     print("MT5 connected")
 
 
+def validate_and_adjust_stops(symbol, side, price, tp, sl):
+    """Validate SL/TP against broker constraints (stops + freeze levels).
+
+    Adjusts SL and TP if they violate broker minimum distance requirements.
+    Uses BOTH trade_stops_level AND trade_freeze_level.
+
+    Args:
+        symbol: Trading pair
+        side: 'BUY' or 'SELL'
+        price: Current price (bid/ask)
+        tp: Take profit level
+        sl: Stop loss level
+
+    Returns:
+        (adjusted_sl, adjusted_tp, was_adjusted)
+    """
+    try:
+        symbol_info = mt5.symbol_info(symbol)
+        if not symbol_info:
+            return sl, tp, False
+
+        # Get BOTH broker constraints
+        stops_level = symbol_info.trade_stops_level
+        freeze_level = symbol_info.trade_freeze_level
+        point = symbol_info.point
+
+        # Use the MAXIMUM of both (most restrictive)
+        min_distance = max(stops_level, freeze_level) * point
+
+        was_adjusted = False
+        adjusted_sl = sl
+        adjusted_tp = tp
+
+        # ─── ADJUST SL ──────────────────────────────────────────────────────
+        if side == 'BUY':
+            # For BUY: SL must be BELOW price by at least min_distance
+            if (price - adjusted_sl) < min_distance:
+                adjusted_sl = price - min_distance
+                was_adjusted = True
+        else:  # SELL
+            # For SELL: SL must be ABOVE price by at least min_distance
+            if (adjusted_sl - price) < min_distance:
+                adjusted_sl = price + min_distance
+                was_adjusted = True
+
+        # ─── ADJUST TP ──────────────────────────────────────────────────────
+        if side == 'BUY':
+            # For BUY: TP must be ABOVE price by at least min_distance
+            if (adjusted_tp - price) < min_distance:
+                adjusted_tp = price + min_distance
+                was_adjusted = True
+        else:  # SELL
+            # For SELL: TP must be BELOW price by at least min_distance
+            if (price - adjusted_tp) < min_distance:
+                adjusted_tp = price - min_distance
+                was_adjusted = True
+
+        if was_adjusted:
+            print(f"  [STOPS_FIXED] {symbol} | stops_level={stops_level} freeze_level={freeze_level} | min_distance={min_distance:.5f} | SL: {sl:.5f}->{adjusted_sl:.5f} | TP: {tp:.5f}->{adjusted_tp:.5f}")
+
+        return adjusted_sl, adjusted_tp, was_adjusted
+
+    except Exception as e:
+        print(f"  [STOPS_ERR] Error validating stops for {symbol}: {e}")
+        return sl, tp, False
+
+
+def get_adaptive_deviation(symbol: str) -> int:
+    """
+    Calculate adaptive deviation based on symbol volatility.
+    JPY pairs: max(100, 3x spread)
+    Standard pairs: max(50, 2x spread)
+    """
+    try:
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return 100  # Safe default
+
+        spread_points = int((tick.ask - tick.bid) / mt5.symbol_info(symbol).point)
+
+        if "JPY" in symbol:
+            return max(100, spread_points * 3)
+        else:
+            return max(50, spread_points * 2)
+    except Exception as e:
+        print(f"  [DEVIATION] Error calculating deviation for {symbol}: {e}")
+        return 100  # Safe default
+
+
 def open_trade(signal):
+    """
+    Open a trade exactly as signal says with retry logic.
 
-    pair  = signal["pair"]
-    side  = signal["side"]
-    tp    = signal["tp"]
-    sl    = signal["sl"]
-    magic = MAGIC_BY_FRAME[signal["frame"]]
+    Returns: (success: bool, ticket: int or None)
 
-    # counter-trend mode: flip direction; SL/TP calculated from signal's own risk distance.
-    if REVERSE_SIGNALS:
-        side = "SELL" if side == "BUY" else "BUY"
-        sl   = 0    # placeholder — set from signal risk distance after tick fetch
-        tp   = 0    # placeholder — set from risk distance × REVERSE_RR
-        print(f"REVERSE: {pair} [{signal['frame']}] signal={signal['side']} -> trading {side}")
+    signal = Signal object with attributes:
+        pair, side, open_price, tp, sl, frame, ...
+    """
 
-    # resolve symbol: try bare name then + suffix, retry up to 3x per name
+    pair = signal.pair
+    side = signal.side
+    tp = signal.tp
+    sl = signal.sl
+
+    # ─── Get symbol ──────────────────────────────────────────────────────
     sym = None
     for name in (pair, pair + "+"):
         mt5.symbol_select(name, True)
-        for _ in range(3):
-            time.sleep(0.5)
-            info = mt5.symbol_info(name)
-            if info is not None and info.trade_mode != 0:
-                pair = name
-                sym  = info
-                break
-        if sym is not None:
+        time.sleep(0.5)
+        info = mt5.symbol_info(name)
+        if info is not None and info.trade_mode != 0:
+            pair = name
+            sym = info
             break
 
     if sym is None:
-        print("SKIP TRADE: symbol unavailable —", signal["pair"])
-        slog(signal["pair"], signal["frame"], "SKIP SYMBOL", "unavailable")
-        return False
+        print(f"  [SKIP] Symbol {pair} not available")
+        return False, None
 
-    # prevent duplicate trades for the same frame
-    existing = mt5.positions_get(symbol=pair)
-    if existing:
-        for p in existing:
-            if p.magic == magic:
-                print(f"SKIP TRADE: already open for {pair} [{signal['frame']}]")
-                return False
-
-    # cap total concurrent bot positions
-    all_bot_pos = [p for p in (mt5.positions_get() or [])
-                   if p.magic in (MAGIC_SHORT, MAGIC_LONG)]
-    if len(all_bot_pos) >= MAX_POSITIONS:
-        print(f"SKIP TRADE: position cap ({MAX_POSITIONS}) reached — {pair} [{signal['frame']}]")
-        slog(pair, signal["frame"], "SKIP CAP", f"max {MAX_POSITIONS} positions reached")
-        return False
-
+    # ─── FIX 3: Ensure tick data available ───────────────────────────────
     tick = mt5.symbol_info_tick(pair)
-
     if tick is None:
-        print("SKIP TRADE: no tick data for", pair)
-        return False
+        print(f"  [SKIP] No tick data for {pair}")
+        return False, None
 
     price = tick.ask if side == "BUY" else tick.bid
 
-    # daily loss circuit breaker: stop opening new trades once daily closed loss is hit
-    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    today_deals = mt5.history_deals_get(today_start, datetime.now(timezone.utc)) or []
-    daily_pnl   = sum(d.profit for d in today_deals
-                      if d.magic in (MAGIC_SHORT, MAGIC_LONG) and d.entry == mt5.DEAL_ENTRY_OUT)
-    if daily_pnl <= -DAILY_MAX_LOSS:
-        print(f"CIRCUIT BREAKER: daily loss ${daily_pnl:.2f} hit limit ${DAILY_MAX_LOSS:.2f} — no new trades")
-        slog(pair, signal["frame"], "SKIP DAILY LIMIT", f"daily loss ${daily_pnl:.2f}")
-        return False
-
-    # if price has already moved past the signal's entry (we're entering late),
-    # tighten SL to the original entry price so we don't risk more than needed.
-    # Skipped for reversed trades — SL is set from signal risk distance after tick fetch.
-    if not REVERSE_SIGNALS:
-        if side == "BUY" and price > signal["open"]:
-            sl = round(signal["open"], sym.digits)
-            print(f"LATE ENTRY BUY {pair}: adjusting SL {signal['sl']} -> {sl} (entry price)")
-            slog(pair, signal["frame"], "SL ADJUSTED", f"late entry: SL {signal['sl']} -> {sl}")
-        elif side == "SELL" and price < signal["open"]:
-            sl = round(signal["open"], sym.digits)
-            print(f"LATE ENTRY SELL {pair}: adjusting SL {signal['sl']} -> {sl} (entry price)")
-            slog(pair, signal["frame"], "SL ADJUSTED", f"late entry: SL {signal['sl']} -> {sl}")
-        else:
-            sl = signal["sl"]
-
-    # for reversed trades:
-    #   Broker SL = REVERSE_BROKER_SL_USD converted to price distance for this symbol/volume.
-    #   Brain dollar stop ($0.60) is the real functional exit — broker SL is the emergency
-    #   backstop that fires only if the bot is offline/crashed.
-    #   TP = SL distance × REVERSE_RR  (default 2:1 → locks $2.40 target)
-    if REVERSE_SIGNALS:
-        tick_val = sym.trade_tick_value * TRADE_VOLUME   # $ per tick at our volume
-        sl_dist  = (REVERSE_BROKER_SL_USD * sym.trade_tick_size) / tick_val
-        tp_dist  = sl_dist * REVERSE_RR
-        if side == "BUY":
-            sl = round(price - sl_dist, sym.digits)
-            tp = round(price + tp_dist, sym.digits)
-        else:
-            sl = round(price + sl_dist, sym.digits)
-            tp = round(price - tp_dist, sym.digits)
-        print(f"REVERSE RR: {pair} entry={price}  SL={sl}  TP={tp}  "
-              f"({REVERSE_RR:.1f}:1  broker_sl=${REVERSE_BROKER_SL_USD}  dist={sl_dist:.5f})")
-
-    # R:R check: reward (TP distance from current price) must be >= MIN_RR_RATIO × risk (SL distance)
-    tp_dist_now = abs(tp - price)
-    sl_dist_now = abs(price - sl)
-    if sl_dist_now > 0:
-        rr = tp_dist_now / sl_dist_now
-        if rr < MIN_RR_RATIO:
-            print(f"SKIP R:R: {pair} R:R={rr:.2f} (need {MIN_RR_RATIO}) — skipping")
-            slog(pair, signal["frame"], "SKIP R:R", f"R:R={rr:.2f} < {MIN_RR_RATIO} — not worth entering")
-            return True   # mark processed — geometry won't improve
-
+    # ─── Send order with retry logic ─────────────────────────────────────
     order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
+    result = None
 
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": pair,
-        "volume": TRADE_VOLUME,
-        "type": order_type,
-        "price": price,
-        "tp": tp,
-        "sl": sl,
-        "deviation": 20,
-        "magic": magic,
-        "comment": signal["frame"],
-        "type_filling": mt5.ORDER_FILLING_IOC,
-        "type_time": mt5.ORDER_TIME_GTC
-    }
+    for attempt in range(MAX_RETRIES):
+        # FIX 7 (NEW): Validate and adjust SL/TP to broker minimum
+        adjusted_sl, adjusted_tp, stops_adjusted = validate_and_adjust_stops(
+            pair, side, price, tp, sl
+        )
 
-    result = mt5.order_send(request)
+        # FIX 6: Calculate adaptive deviation based on spread
+        deviation = get_adaptive_deviation(pair)
 
-    if result.retcode == 10009:
-        print("OPEN RESULT:", result)
-        slog(pair, signal["frame"], "OPENED", f"{side} @ {result.price}")
-        return True
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": pair,
+            "volume": TRADE_VOLUME,
+            "type": order_type,
+            "price": price,
+            "tp": adjusted_tp,  # Use adjusted TP
+            "sl": adjusted_sl,  # Use adjusted SL
+            "deviation": deviation,
+            "magic": MAGIC_NUMBER,
+            "comment": "blind",
+            "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_time": mt5.ORDER_TIME_GTC
+        }
 
-    if result.retcode == 10016:
-        print(f"SKIP PERMANENT: {pair} [{signal['frame']}] invalid stops — price moved too far, giving up")
-        slog(pair, signal["frame"], "SKIP INVALID", "price moved past SL, giving up")
-        return True   # mark processed, never retry
+        result = mt5.order_send(request)
 
-    print("OPEN FAILED:", result)
-    slog(pair, signal["frame"], "OPEN FAILED", str(result.retcode))
-    return False
+        # FIX 5: Log MT5 errors properly
+        if result:
+            print(f"  [MT5] Attempt {attempt+1}: retcode={result.retcode} comment={result.comment}")
+
+        # Success - break loop
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            print(f"  [OPENED] {side} {pair} @ {result.price} | SL: {adjusted_sl:.5f} | TP: {adjusted_tp:.5f} | Ticket: {result.order} | Deviation: {deviation}")
+            return True, result.order
+
+        # Price moved - try again with fresh price
+        if result and result.retcode == 10016:  # Price moved
+            if attempt < MAX_RETRIES - 1:
+                print(f"  [RETRY] Price moved (attempt {attempt+1}/{MAX_RETRIES}), refreshing...")
+                tick = mt5.symbol_info_tick(pair)
+                if tick:
+                    price = tick.ask if side == "BUY" else tick.bid
+                time.sleep(0.2)
+            else:
+                print(f"  [FAIL] Price moved after {MAX_RETRIES} retries - skipping")
+                return True, None  # Mark as processed
+        else:
+            # Other errors - don't retry
+            if result:
+                print(f"  [FAILED] Order rejected: retcode={result.retcode} comment={result.comment}")
+            else:
+                print(f"  [FAILED] Order send returned None")
+            return False, None
+
+    return False, None
+
 
 
 def close_trade(pair):
+    """Close all positions for this pair with tick data check and retry logic."""
 
+    closed_count = 0
     for name in (pair, pair + "+"):
+        # FIX 3: Ensure tick data available before closing
+        tick = mt5.symbol_info_tick(name)
+        if tick is None:
+            print(f"  [SKIP] No tick data for {name} - cannot close")
+            continue
+
         positions = mt5.positions_get(symbol=name)
         if not positions:
             continue
-        for p in positions:
-            if p.magic not in (MAGIC_SHORT, MAGIC_LONG):
+
+        for pos in positions:
+            if pos.magic != MAGIC_NUMBER:
                 continue
-            tick = mt5.symbol_info_tick(p.symbol)
-            if p.type == mt5.POSITION_TYPE_BUY:
-                order_type = mt5.ORDER_TYPE_SELL
-                price = tick.bid
-            else:
-                order_type = mt5.ORDER_TYPE_BUY
-                price = tick.ask
+
+            ticket = pos.ticket
+            entry_price = pos.price_open
+
+            # FIX 4: Track close attempts
+            if ticket not in close_attempts:
+                close_attempts[ticket] = 0
+            close_attempts[ticket] += 1
+
+            # If exceeded max attempts, give up and remove from tracking
+            if close_attempts[ticket] > MAX_CLOSE_ATTEMPTS:
+                print(f"  [FORCE CLOSE] T{ticket} exceeded max close attempts ({MAX_CLOSE_ATTEMPTS}) - removing from tracking")
+                if ticket in close_attempts:
+                    del close_attempts[ticket]
+                continue
+
+            # FIX 6: Use adaptive deviation
+            deviation = get_adaptive_deviation(name)
+
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
-                "position": p.ticket,
-                "symbol": p.symbol,
-                "volume": p.volume,
-                "type": order_type,
-                "price": price,
-                "deviation": 20,
-                "magic": p.magic,
+                "symbol": name,
+                "volume": pos.volume,
+                "type": mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY,
+                "position": pos.ticket,
+                "deviation": deviation,
+                "magic": MAGIC_NUMBER,
+                "comment": "close",
                 "type_filling": mt5.ORDER_FILLING_IOC,
                 "type_time": mt5.ORDER_TIME_GTC
             }
+
             result = mt5.order_send(request)
-            print("CLOSE RESULT:", result)
-            if result.retcode == 10009:
-                frame = "short" if p.magic == MAGIC_SHORT else "long"
-                slog(p.symbol, frame, "CLOSED", f"@ {result.price}")
+
+            # FIX 5: Log MT5 errors properly
+            if result:
+                print(f"  [MT5] Close attempt {close_attempts[ticket]}: retcode={result.retcode} comment={result.comment}")
+
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                # Fetch real close price from deal history
+                close_deal = None
+                try:
+                    deals = mt5.history_deals_get(position=ticket, group="*")
+                    if deals:
+                        for deal in reversed(deals):
+                            if deal.entry == 1:  # Closing deal
+                                close_deal = deal
+                                break
+                except Exception:
+                    pass
+
+                if close_deal:
+                    close_price = close_deal.price
+                    close_profit = close_deal.profit
+                    price_diff = close_price - entry_price
+                    print(f"  [CLOSED] {name} T{ticket} Entry: {entry_price} -> Close: {close_price} | Diff: {price_diff:.6f} | Profit: ${close_profit:.2f}")
+                else:
+                    print(f"  [CLOSED] {name} | Profit: ${pos.profit:.2f}")
+
+                closed_count += 1
+                # Clear close attempt counter on success
+                if ticket in close_attempts:
+                    del close_attempts[ticket]
+            elif result and result.retcode == 10016:
+                # Price moved - will retry next cycle
+                print(f"  [RETRY] Close price moved for T{ticket}")
+
+    return closed_count > 0
+
+
+
+def close_position_by_ticket(ticket, pair=None):
+    """Close a specific position by ticket number with retry logic and tick checks."""
+
+    # ──── EXECUTION TRACE ────
+    import traceback
+    import inspect
+
+    stack = traceback.extract_stack()
+    caller_frame = None
+    caller_function = "UNKNOWN"
+
+    # Find caller (skip this function and decorator frames)
+    for frame in reversed(stack[:-1]):
+        if "close_position_by_ticket" not in frame.name:
+            caller_frame = frame
+            caller_function = frame.name if frame.name else "UNKNOWN"
+            break
+
+    print(f"[TRACE_CLOSE] Ticket {ticket} close initiated")
+    print(f"[TRACE_CLOSE] Caller: {caller_function}() at {caller_frame.filename.split(chr(92))[-1] if caller_frame else 'unknown'}:{caller_frame.lineno if caller_frame else '?'}")
+
+    # FIX 4: Track close attempts per ticket
+    if ticket not in close_attempts:
+        close_attempts[ticket] = 0
+    close_attempts[ticket] += 1
+
+    # If exceeded max attempts, give up
+    if close_attempts[ticket] > MAX_CLOSE_ATTEMPTS:
+        print(f"[FORCE CLOSE] Ticket {ticket} exceeded max close attempts ({MAX_CLOSE_ATTEMPTS}) - removing from tracking")
+        if ticket in close_attempts:
+            del close_attempts[ticket]
+        return False
+
+    if ticket in [1029131995, 1028771560, 1028924631]:  # Known problem tickets
+        print(f"[TRACE_CLOSE] **PROBLEM TICKET DETECTED** (attempt {close_attempts[ticket]}/{MAX_CLOSE_ATTEMPTS})")
+
+    names = [(pair, pair + "+")] if pair else [(None, None)]
+
+    for name1, name2 in names:
+        for name in (name1, name2):
+            if name is None:
+                continue
+
+            # FIX 3: Ensure tick data available before closing
+            tick = mt5.symbol_info_tick(name)
+            if tick is None:
+                print(f"  [SKIP] No tick data for {name} - cannot close T{ticket}")
+                continue
+
+            positions = mt5.positions_get(symbol=name)
+            if not positions:
+                continue
+
+            for pos in positions:
+                if pos.ticket != ticket or pos.magic != MAGIC_NUMBER:
+                    continue
+
+                # Store entry details BEFORE close
+                entry_price = pos.price_open
+                entry_time = datetime.now(timezone.utc)
+
+                # Get tick info before close
+                bid_before = tick.bid if tick else 0
+                ask_before = tick.ask if tick else 0
+
+                # FIX 6: Use adaptive deviation
+                deviation = get_adaptive_deviation(name)
+
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": name,
+                    "volume": pos.volume,
+                    "type": mt5.ORDER_TYPE_SELL if pos.type == 0 else mt5.ORDER_TYPE_BUY,
+                    "position": ticket,
+                    "deviation": deviation,
+                    "magic": MAGIC_NUMBER,
+                    "comment": "close",
+                    "type_filling": mt5.ORDER_FILLING_IOC,
+                    "type_time": mt5.ORDER_TIME_GTC
+                }
+
+                result = mt5.order_send(request)
+
+                # FIX 5: Log MT5 errors properly
+                if result:
+                    print(f"  [MT5] Close attempt {close_attempts[ticket]}: retcode={result.retcode} comment={result.comment}")
+
+                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                    # Close succeeded - fetch real close price from deal history
+                    close_deal = None
+                    try:
+                        # Get deals for this position (most recent deals)
+                        deals = mt5.history_deals_get(position=ticket, group="*")
+                        if deals:
+                            # Find the CLOSING deal (should be most recent)
+                            for deal in reversed(deals):
+                                # Deal type: DEAL_TYPE_BUY=0, DEAL_TYPE_SELL=1
+                                # Deal entry: DEAL_ENTRY_IN=0, DEAL_ENTRY_OUT=1
+                                if deal.entry == 1:  # CLOSING deal
+                                    close_deal = deal
+                                    break
+                    except Exception as e:
+                        print(f"    [DEBUG] Deal history error: {e}")
+
+                    if close_deal:
+                        close_price = close_deal.price
+                        close_profit = close_deal.profit
+                        price_diff = close_price - entry_price
+
+                        # Detect if close at entry or real movement
+                        if abs(price_diff) < 0.00001 and close_profit != 0:
+                            warning = " [WARNING: Close at entry but non-zero profit - likely friction only]"
+                        else:
+                            warning = ""
+
+                        print(f"  [CLOSED] T{ticket} Entry: {entry_price} -> Close: {close_price} | Movement: {price_diff:.6f} pips | Profit: ${close_profit:.2f}{warning}")
+
+                        # ─── CLOSE CORRELATION TRACE ─────────────────────────────────────
+                        # Log close details for correlation with trailing stop moves
+                        close_reason = caller_function if caller_function != "UNKNOWN" else "UNKNOWN"
+                        print(f"[CLOSE_TRACE] T{ticket} | reason={close_reason} | close={close_price:.5f} | sl={pos.sl:.5f} | tp={pos.tp:.5f} | entry={entry_price:.5f} | profit=${close_profit:.2f}")
+                    else:
+                        # Fallback if deal history unavailable
+                        print(f"  [CLOSED] T{ticket} (deal history unavailable) | Entry: {entry_price} | Profit: ${pos.profit:.2f}")
+
+                        # ─── CLOSE CORRELATION TRACE (FALLBACK) ─────────────────────────────────
+                        close_reason = caller_function if caller_function != "UNKNOWN" else "UNKNOWN"
+                        print(f"[CLOSE_TRACE] T{ticket} | reason={close_reason} | close=UNKNOWN | sl={pos.sl:.5f} | tp={pos.tp:.5f} | entry={entry_price:.5f} | profit=${pos.profit:.2f}")
+
+                    # Verify position actually closed in MT5
+                    time.sleep(0.5)  # Wait for MT5 to update
+                    remaining = mt5.positions_get(ticket=ticket)
+                    if remaining:
+                        print(f"    [ERROR] Position T{ticket} still exists in MT5 after close!")
+                    else:
+                        print(f"    [OK] Position T{ticket} fully closed in MT5")
+
+                    # Clear close attempt counter on success
+                    if ticket in close_attempts:
+                        del close_attempts[ticket]
+
+                    return True
+                elif result and result.retcode == 10016:
+                    # Price moved - will retry next cycle
+                    print(f"  [RETRY] Close price moved for T{ticket}, will retry")
+                    return False
+
+    print(f"  [WARN] Position ticket {ticket} not found")
+    return False
+
 
 
 def get_position(pair):
-    """Return the open bot position for pair (bare or + suffix), or None."""
+    """Get any open position for this pair."""
+
     for name in (pair, pair + "+"):
         positions = mt5.positions_get(symbol=name)
         if positions:
             for p in positions:
-                if p.magic in (MAGIC_SHORT, MAGIC_LONG):
+                if p.magic == MAGIC_NUMBER:
                     return p
+
     return None
 
 
-def manage_positions():
-    """Time-based exit only. SL management is owned entirely by active_brain."""
-
-    positions = mt5.positions_get()
-
-    if not positions:
-        return
-
-    now = datetime.now(timezone.utc)
-
-    for p in positions:
-
-        if p.magic not in (MAGIC_SHORT, MAGIC_LONG):
-            continue
-
-        frame = "short" if p.magic == MAGIC_SHORT else "long"
-
-        # track highest profit seen while this position is open
-        _peak_profit[p.ticket] = max(_peak_profit.get(p.ticket, p.profit), p.profit)
-
-        if p.tp == 0:
-            continue   # no TP set — can't calculate distances
-
-        sym  = mt5.symbol_info(p.symbol)
-        tick = mt5.symbol_info_tick(p.symbol)
-        if sym is None or tick is None:
-            continue
-
-        open_time = datetime.fromtimestamp(p.time, tz=timezone.utc)
-        age_hours = (now - open_time).total_seconds() / 3600
-        max_hours = SHORT_MAX_HOURS if frame == "short" else LONG_MAX_HOURS
-
-        # time-based exit: cut a losing position that has overstayed its signal window
-        if age_hours > max_hours and p.profit < 0:
-            print(f"TIME EXIT: {p.symbol} [{frame}] {age_hours:.1f}h, P&L={p.profit:.2f}")
-            slog(p.symbol, frame, "TIME EXIT", f"{age_hours:.1f}h old, still losing — closing")
-            close_type  = mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
-            close_price = tick.bid             if p.type == mt5.POSITION_TYPE_BUY else tick.ask
-            mt5.order_send({
-                "action": mt5.TRADE_ACTION_DEAL,
-                "position": p.ticket, "symbol": p.symbol,
-                "volume": p.volume, "type": close_type,
-                "price": close_price, "deviation": 20,
-                "magic": p.magic,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-                "type_time": mt5.ORDER_TIME_GTC
-            })
-
-
-def profit_guard():
-    """
-    Fast profit monitor — runs every second.
-
-    Activates once a position has reached PROFIT_GUARD_MIN ($0.20).
-    Three layered checks, any one triggers an immediate close:
-
-      1. RAPID DROP   — profit fell PROFIT_GUARD_DROP_USD or more within
-                        PROFIT_GUARD_DROP_SECS seconds.  Catches fast reversals
-                        before they wipe out the gain entirely.
-
-      2. FLOOR        — profit fell below PROFIT_GUARD_FLOOR ($0.04 absolute).
-                        Prevents a good trade from being held all the way to zero.
-
-      3. RETAIN       — profit is below PROFIT_GUARD_RETAIN (40%) of all-time peak.
-                        Catches slow bleeds where velocity alone wouldn't fire.
-
-    Only closes when one of these fires; normal retracements that stay above the
-    floor and retain level are left alone so profits keep running.
-    """
-    positions = mt5.positions_get()
-    if not positions or not PROFIT_GUARD_ENABLED:
-        return
-
-    now_ts = time.time()
-
-    for p in positions:
-        if p.magic not in (MAGIC_SHORT, MAGIC_LONG):
-            continue
-
-        frame = "short" if p.magic == MAGIC_SHORT else "long"
-
-        # update peak profit (shared with manage_positions)
-        prev_peak = _peak_profit.get(p.ticket, 0)
-        peak      = max(prev_peak, p.profit)
-        _peak_profit[p.ticket] = peak
-
-        # maintain rolling profit history for this ticket
-        hist = _profit_history.setdefault(p.ticket, deque(maxlen=60))
-        hist.append((now_ts, p.profit))
-
-        # guard only activates once we've been meaningfully in profit
-        if peak < PROFIT_GUARD_MIN:
-            continue
-
-        # ── check 1: rapid drop within DROP_SECS window ──────────────────────
-        window = [pnl for ts, pnl in hist if now_ts - ts <= PROFIT_GUARD_DROP_SECS]
-        rapid_drop = False
-        reason     = ""
-        if len(window) >= 3:
-            drop = max(window) - p.profit
-            if drop >= PROFIT_GUARD_DROP_USD:
-                rapid_drop = True
-                reason = (f"rapid drop ${drop:.2f} in {PROFIT_GUARD_DROP_SECS}s "
-                          f"(peak=${peak:.2f} now=${p.profit:.2f})")
-
-        # ── check 2: absolute floor ───────────────────────────────────────────
-        at_floor = p.profit < PROFIT_GUARD_FLOOR
-        if at_floor and not reason:
-            reason = f"below floor ({p.profit:.2f} < {PROFIT_GUARD_FLOOR}) after peak ${peak:.2f}"
-
-        # ── check 3: retain fraction of peak (slow-bleed backstop) ───────────
-        retain_target = peak * PROFIT_GUARD_RETAIN
-        retain_fail   = p.profit < retain_target
-        if retain_fail and not reason:
-            reason = (f"retain fail: ${p.profit:.2f} < "
-                      f"{PROFIT_GUARD_RETAIN*100:.0f}% of peak ${peak:.2f}")
-
-        if not (rapid_drop or at_floor or retain_fail):
-            continue
-
-        # one of the checks fired — close immediately
-        print(f"PROFIT GUARD: {p.symbol} [{frame}] {reason} — closing")
-        slog(p.symbol, frame, "PROFIT GUARD", reason)
-
-        tick = mt5.symbol_info_tick(p.symbol)
-        if tick is None:
-            continue
-
-        close_type  = mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
-        close_price = tick.bid             if p.type == mt5.POSITION_TYPE_BUY else tick.ask
-
-        result = mt5.order_send({
-            "action":       mt5.TRADE_ACTION_DEAL,
-            "position":     p.ticket,
-            "symbol":       p.symbol,
-            "volume":       p.volume,
-            "type":         close_type,
-            "price":        close_price,
-            "deviation":    20,
-            "magic":        p.magic,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-            "type_time":    mt5.ORDER_TIME_GTC
-        })
-
-        if result.retcode == 10009:
-            slog(p.symbol, frame, "CLOSED",
-                 f"profit guard @ {result.price}  locked ${p.profit:.2f}")
-        else:
-            print(f"PROFIT GUARD CLOSE FAILED: {p.symbol} retcode={result.retcode}")
-
-
-# ── Active Trade Brain ─────────────────────────────────────────────────────────
-
-def _momentum_score(ticket):
-    """Returns -2..+2: profit trend over last 30s and 60s. Negative = falling."""
-    hist = _profit_history.get(ticket)
-    if not hist or len(hist) < 3:
-        return 0
-    now_ts  = time.time()
-    current = hist[-1][1]
-    score   = 0
-    for window in (30, 60):
-        past = next((pnl for ts, pnl in reversed(list(hist)) if now_ts - ts >= window), None)
-        if past is not None:
-            score += 1 if current > past else (-1 if current < past else 0)
-    return score
-
-
-def _brain_close(p, tick, frame, reason):
-    close_type  = mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
-    close_price = tick.bid             if p.type == mt5.POSITION_TYPE_BUY else tick.ask
-    result = mt5.order_send({
-        "action":       mt5.TRADE_ACTION_DEAL,
-        "position":     p.ticket,
-        "symbol":       p.symbol,
-        "volume":       p.volume,
-        "type":         close_type,
-        "price":        close_price,
-        "deviation":    20,
-        "magic":        p.magic,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-        "type_time":    mt5.ORDER_TIME_GTC
-    })
-    if result.retcode == 10009:
-        slog(p.symbol, frame, "CLOSED", f"brain {reason} @ {result.price}  pnl=${p.profit:.2f}")
-    else:
-        print(f"BRAIN CLOSE FAILED: {p.symbol} retcode={result.retcode}")
-    return result.retcode == 10009
-
-
-def _brain_sltp(p, new_sl, new_tp, sym, frame, reason):
-    result = mt5.order_send({
-        "action":   mt5.TRADE_ACTION_SLTP,
-        "position": p.ticket,
-        "symbol":   p.symbol,
-        "sl":       round(new_sl, sym.digits),
-        "tp":       round(new_tp, sym.digits)
-    })
-    if result.retcode in (10009, 10025):
-        print(f"BRAIN: {p.symbol} [{frame}] {reason}")
-        slog(p.symbol, frame, "BRAIN", reason)
-    else:
-        print(f"BRAIN SLTP FAILED: {p.symbol} retcode={result.retcode}")
-
-
-def active_brain():
-    """
-    Runs every second. Five behaviours:
-
-    1. DEAD TRADE KILLER  — close if peak never reached $0.05 after 30 min
-    2. DOLLAR STOP        — close immediately if floating loss exceeds $0.60
-    3. STEPPED PROFIT LOCK — ratchet SL up as profit grows:
-                              $0.30 → SL to entry   (lock $0.00)
-                              $0.60 → SL locks $0.30
-                              $0.90 → SL locks $0.60
-                              $1.20 → SL locks $0.90
-                              $1.50 → SL locks $1.20
-    4. PROFIT TRAIL       — trail SL behind price once trade is 30%+ into TP
-    5. TP EXTENSION       — push TP 50% further when price is at 80% and still moving
-    """
-    if not BRAIN_ENABLED:
-        return
-
-    positions = mt5.positions_get()
-    if not positions:
-        return
-
-    now    = datetime.now(timezone.utc)
-    now_ts = time.time()
-
-    for p in positions:
-        if p.magic not in (MAGIC_SHORT, MAGIC_LONG):
-            continue
-        if p.tp == 0:
-            continue
-
-        frame = "short" if p.magic == MAGIC_SHORT else "long"
-        sym   = mt5.symbol_info(p.symbol)
-        tick  = mt5.symbol_info_tick(p.symbol)
-        if sym is None or tick is None:
-            continue
-
-        # update shared state
-        hist = _profit_history.setdefault(p.ticket, deque(maxlen=120))
-        hist.append((now_ts, p.profit))
-        peak = max(_peak_profit.get(p.ticket, p.profit), p.profit)
-        _peak_profit[p.ticket] = peak
-
-        age_mins = (now - datetime.fromtimestamp(p.time, tz=timezone.utc)).total_seconds() / 60
-
-        if p.type == mt5.POSITION_TYPE_BUY:
-            tp_dist  = p.tp - p.price_open
-            cur_move = tick.bid - p.price_open
-        else:
-            tp_dist  = p.price_open - p.tp
-            cur_move = p.price_open - tick.ask
-
-        if tp_dist <= 0:
-            continue
-
-        pct = cur_move / tp_dist * 100
-
-        # ── 1. DEAD TRADE KILLER ──────────────────────────────────────────────
-        if age_mins >= BRAIN_DEAD_MINS and peak < BRAIN_DEAD_MIN_PROFIT:
-            print(f"BRAIN DEAD TRADE: {p.symbol} [{frame}] {age_mins:.0f}min  peak=${peak:.2f}")
-            slog(p.symbol, frame, "DEAD TRADE", f"{age_mins:.0f}min open, never profitable — closing")
-            _brain_close(p, tick, frame, "dead trade")
-            continue
-
-        # ── 2. DOLLAR STOP LOSS ───────────────────────────────────────────────
-        # close immediately if floating loss exceeds $0.60 — hard cap per trade
-        if p.profit <= -DOLLAR_STOP_LOSS:
-            print(f"DOLLAR STOP: {p.symbol} [{frame}] loss=${p.profit:.2f} — closing")
-            slog(p.symbol, frame, "DOLLAR STOP", f"loss=${p.profit:.2f} hit -${DOLLAR_STOP_LOSS} cap")
-            _brain_close(p, tick, frame, f"dollar stop ${p.profit:.2f}")
-            continue
-
-        # ── 3. STEPPED PROFIT LOCK ────────────────────────────────────────────
-        # Ratchet SL upward as floating profit grows — never gives back more
-        # than one step. SL is only ever moved in the favourable direction.
-        #   $0.30 → SL to entry      (lock $0.00)
-        #   $0.60 → SL locks $0.30
-        #   $0.90 → SL locks $0.60
-        #   $1.20 → SL locks $0.90
-        #   $1.50 → SL locks $1.20
-        if p.profit >= 0.30 and cur_move > 0:
-            if   p.profit >= 1.50:
-                lock_target = 1.20
-            elif p.profit >= 1.20:
-                lock_target = 0.90
-            elif p.profit >= 0.90:
-                lock_target = 0.60
-            elif p.profit >= 0.60:
-                lock_target = 0.30
-            else:
-                lock_target = 0.00
-
-            lock_ratio = lock_target / p.profit
-            if p.type == mt5.POSITION_TYPE_BUY:
-                lock_sl = round(p.price_open + cur_move * lock_ratio, sym.digits)
-                if lock_sl > round(p.sl, sym.digits):
-                    _brain_sltp(p, lock_sl, p.tp, sym, frame,
-                                f"step lock ${lock_target:.2f} SL->{lock_sl} (profit=${p.profit:.2f})")
-            else:
-                lock_sl = round(p.price_open - cur_move * lock_ratio, sym.digits)
-                if p.sl == 0 or lock_sl < round(p.sl, sym.digits):
-                    _brain_sltp(p, lock_sl, p.tp, sym, frame,
-                                f"step lock ${lock_target:.2f} SL->{lock_sl} (profit=${p.profit:.2f})")
-
-        score = _momentum_score(p.ticket)
-
-        # ── 4. PROFIT PROTECTION TRAIL ────────────────────────────────────────
-        # once trade is ≥30% into TP, keep SL trailing behind current price
-        if pct >= 30 and p.profit > 0:
-            if p.type == mt5.POSITION_TYPE_BUY:
-                new_sl    = round(tick.bid - BRAIN_EMERGENCY_TRAIL * tp_dist, sym.digits)
-                min_move  = 10 ** (-sym.digits + 1)
-                if new_sl > round(p.sl, sym.digits) + min_move:
-                    _brain_sltp(p, new_sl, p.tp, sym, frame,
-                                f"profit trail SL->{new_sl} ({pct:.0f}% of TP)")
-            else:
-                new_sl   = round(tick.ask + BRAIN_EMERGENCY_TRAIL * tp_dist, sym.digits)
-                min_move = 10 ** (-sym.digits + 1)
-                if p.sl == 0 or new_sl < round(p.sl, sym.digits) - min_move:
-                    _brain_sltp(p, new_sl, p.tp, sym, frame,
-                                f"profit trail SL->{new_sl} ({pct:.0f}% of TP)")
-
-        # ── 5. TP EXTENSION ───────────────────────────────────────────────────
-        if p.ticket not in _tp_extended and pct >= BRAIN_TP_EXTEND_PCT * 100 and score >= 1:
-            extra = tp_dist * (BRAIN_TP_EXTEND_MULT - 1)
-            if p.type == mt5.POSITION_TYPE_BUY:
-                new_tp = round(p.tp + extra, sym.digits)
-            else:
-                new_tp = round(p.tp - extra, sym.digits)
-            _brain_sltp(p, p.sl, new_tp, sym, frame,
-                        f"TP extended {p.tp}->{new_tp} ({pct:.0f}% of orig, score={score})")
-            _tp_extended.add(p.ticket)
-
-    # cleanup state dicts for tickets no longer open (prevents unbounded growth)
-    active_tickets = {p.ticket for p in positions if p.magic in (MAGIC_SHORT, MAGIC_LONG)}
-    for t in list(_peak_profit.keys()):
-        if t not in active_tickets:
-            del _peak_profit[t]
-    for t in list(_profit_history.keys()):
-        if t not in active_tickets:
-            del _profit_history[t]
-    _tp_extended.intersection_update(active_tickets)
-
-
 def show_open_positions():
+    """Display all open positions."""
 
     positions = mt5.positions_get()
-
     if not positions:
-        print("ACTIVE TRADES: none")
+        print("  No open positions")
         return
 
-    print("\nACTIVE TRADES")
-
-    for p in positions:
-
-        side = "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL"
-
-        print(
-            p.symbol,
-            side,
-            "vol:", p.volume,
-            "profit:", round(p.profit, 2)
-        )
+    print(f"  Open positions: {len(positions)}")
+    for p in positions[:5]:  # Show first 5
+        pos_type = "BUY" if p.type == 0 else "SELL"
+        print(f"    [{p.symbol}] {pos_type} @ {p.price_open} | Profit: ${p.profit:.2f}")
 
 
-def show_recent_history(minutes=10):
-
-    now = datetime.now()
-    past = now - timedelta(minutes=minutes)
-
-    deals = mt5.history_deals_get(past, now)
-
-    if not deals:
-        return
-
-    print("\nRECENT CLOSED TRADES")
-
-    for d in deals:
-
-        if d.entry != mt5.DEAL_ENTRY_OUT:
-            continue
-
-        print(
-            d.symbol,
-            "profit:", round(d.profit, 2),
-            "time:", datetime.fromtimestamp(d.time).strftime("%H:%M:%S")
-        )
-
-
-def account_summary(save=True):
+def account_summary():
+    """Show account stats."""
 
     info = mt5.account_info()
-    if info is None:
+    if not info:
         return
 
-    # all our closed deals, from the beginning of time
-    epoch     = datetime(2000, 1, 1, tzinfo=timezone.utc)
-    now       = datetime.now(timezone.utc)
-    all_deals = mt5.history_deals_get(epoch, now) or []
-
-    our_deals  = [d for d in all_deals
-                  if d.magic in (MAGIC_SHORT, MAGIC_LONG)
-                  and d.entry == mt5.DEAL_ENTRY_OUT]
-
-    wins      = [d for d in our_deals if d.profit > 0]
-    losses    = [d for d in our_deals if d.profit < 0]
-    breakeven = [d for d in our_deals if d.profit == 0]
-    total_pnl = sum(d.profit for d in our_deals)
-    win_rate  = len(wins) / len(our_deals) * 100 if our_deals else 0
-    avg_win   = sum(d.profit for d in wins)   / len(wins)   if wins   else 0
-    avg_loss  = sum(d.profit for d in losses) / len(losses) if losses else 0
-    best      = max(our_deals, key=lambda d: d.profit, default=None)
-    worst     = min(our_deals, key=lambda d: d.profit, default=None)
-
-    # open positions
-    positions = mt5.positions_get() or []
-    our_pos   = [p for p in positions if p.magic in (MAGIC_SHORT, MAGIC_LONG)]
-    open_pnl  = sum(p.profit for p in our_pos)
-
-    W  = 54
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    lines = [
-        f"\n{'═'*W}",
-        f"  BALANCE SHEET   {ts}",
-        f"{'═'*W}",
-        f"  Balance      ${info.balance:>10.2f}",
-        f"  Equity       ${info.equity:>10.2f}",
-        f"  Open P&L     ${open_pnl:>+10.2f}   ({len(our_pos)} open)",
-        f"{'─'*W}",
-    ]
-
-    if our_pos:
-        lines.append("  OPEN POSITIONS")
-        for p in our_pos:
-            side   = "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL"
-            frame  = "short" if p.magic == MAGIC_SHORT else "long"
-            tp_dist = abs(p.tp - p.price_open) if p.tp else 0
-            tick   = mt5.symbol_info_tick(p.symbol)
-            if tick and tp_dist:
-                cur    = tick.bid if p.type == mt5.POSITION_TYPE_BUY else tick.ask
-                pdiff  = cur - p.price_open if p.type == mt5.POSITION_TYPE_BUY else p.price_open - cur
-                pct    = pdiff / tp_dist * 100
-            else:
-                pct = 0
-            peak = _peak_profit.get(p.ticket, p.profit)
-            lines.append(
-                f"  {p.symbol:<12} {side:<4} [{frame}]"
-                f"  pnl:${p.profit:>+6.2f}"
-                f"  {pct:>+5.0f}% of TP"
-                f"  peak:${peak:>+6.2f}"
-            )
-        lines.append(f"{'─'*W}")
-
-    lines += [
-        f"  CLOSED TRADES (bot only)",
-        f"  Total        {len(our_deals):>4}   |  Win rate:  {win_rate:>5.1f}%",
-        f"  Wins         {len(wins):>4}   |  Losses:    {len(losses):>4}   |  BE: {len(breakeven)}",
-        f"  Total P&L    ${total_pnl:>+9.2f}",
-        f"  Avg win      ${avg_win:>+9.2f}   |  Avg loss:  ${avg_loss:>+.2f}",
-    ]
-
-    if best:
-        t = datetime.fromtimestamp(best.time).strftime("%m-%d %H:%M")
-        lines.append(f"  Best trade   ${best.profit:>+9.2f}   {best.symbol:<12} {t}")
-    if worst:
-        t = datetime.fromtimestamp(worst.time).strftime("%m-%d %H:%M")
-        lines.append(f"  Worst trade  ${worst.profit:>+9.2f}   {worst.symbol:<12} {t}")
-
-    # last 5 closed trades
-    if our_deals:
-        last5 = sorted(our_deals, key=lambda d: d.time)[-5:]
-        lines.append(f"{'─'*W}")
-        lines.append(f"  LAST {len(last5)} CLOSED")
-        for d in reversed(last5):
-            t    = datetime.fromtimestamp(d.time).strftime("%m-%d %H:%M")
-            flag = "WIN " if d.profit > 0 else ("LOSS" if d.profit < 0 else "BE  ")
-            lines.append(f"  {flag}  {d.symbol:<12}  ${d.profit:>+7.2f}   {t}")
-
-    lines.append(f"{'═'*W}")
-
-    text = "\n".join(lines)
-    print(text)
-
-    if save:
-        with open("balance.log", "a", buffering=1, encoding="utf-8") as f:
-            f.write(text + "\n")
+    print(f"  Account: Balance ${info.balance:.2f} | Equity ${info.equity:.2f}")
