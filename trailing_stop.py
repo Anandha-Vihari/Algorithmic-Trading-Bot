@@ -422,15 +422,7 @@ class TrailingStopManager:
                 else:  # SELL
                     new_sl = entry_price - price_move
 
-                # ─── FIX 6: ADD SPREAD BUFFER ───────────────────────────────────
-                buffer = max(spread * 2, 0.0001)
-
-                if pos.type == mt5_module.POSITION_TYPE_BUY:
-                    new_sl -= buffer
-                else:
-                    new_sl += buffer
-
-                # ─── FIX 7: PREVENT BACKWARD SL ─────────────────────────────────
+                # ─── FIX 6: PREVENT BACKWARD SL ─────────────────────────────────
                 if pos.type == mt5_module.POSITION_TYPE_BUY:
                     if new_sl <= current_sl:
                         continue  # Would move backward, skip
@@ -438,7 +430,7 @@ class TrailingStopManager:
                     if new_sl >= current_sl:
                         continue  # Would move backward, skip
 
-                # ─── FIX 7.5: VALIDATE SL AGAINST BROKER MINIMUM ──────────────────
+                # ─── FIX 6.5: VALIDATE SL AGAINST BROKER MINIMUM ──────────────────
                 # Ensure new SL respects broker minimum stop distance (incl. freeze level)
                 try:
                     symbol_info_validation = mt5_module.symbol_info(symbol)
@@ -479,7 +471,7 @@ class TrailingStopManager:
                     print(f"[TRAIL_ERR] T{ticket} Exception validating SL: {e}")
                     continue
 
-                # ─── FIX 8: APPLY SL UPDATE ─────────────────────────────────────
+                # ─── FIX 7: APPLY SL UPDATE ─────────────────────────────────────
                 # FIX 3: Add debug logging BEFORE sending
                 print(f"  [TRAIL_DEBUG] T{ticket} | Sending SL update: {current_sl:.5f} → {new_sl:.5f} | distance from price {pos.price_current:.5f}: {abs(pos.price_current - new_sl):.5f}")
 
