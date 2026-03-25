@@ -22,8 +22,10 @@ SAFETY GUARANTEES:
 
 import MetaTrader5 as mt5
 from typing import Dict, Tuple, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from operational_safety import log, LogLevel
+import json
+import os
 
 
 class TrailingStopManager:
@@ -36,6 +38,9 @@ class TrailingStopManager:
 
         # ticket → timestamp when phase changed (for logging)
         self.phase_change_log = {}
+
+        # Load persisted position metadata from previous sessions
+        self._load_position_meta()
 
     def register_position(self, ticket: int, symbol: str, side: str,
                          entry_price: float, tp: float, original_sl: float):
@@ -63,6 +68,9 @@ class TrailingStopManager:
         print(f"[TRAIL$_REGISTER] T{ticket} {symbol} {side} | Entry: {entry_price:.5f} | TP: {tp:.5f} | SL: {original_sl:.5f}")
         log(LogLevel.DEBUG, f"[TRAIL] Registered T{ticket} {symbol} {side} | Entry: {entry_price} | TP: {tp}")
 
+        # Persist changes immediately
+        self._save_position_meta()
+
     def remove_position(self, ticket: int):
         """Remove position from tracking when closed.
 
@@ -72,6 +80,48 @@ class TrailingStopManager:
             del self.position_meta[ticket]
         if ticket in self.phase_change_log:
             del self.phase_change_log[ticket]
+
+        # Persist changes immediately
+        self._save_position_meta()
+
+    def _save_position_meta(self):
+        """Save position metadata to disk for persistence across restarts."""
+        try:
+            # Convert to JSON-serializable format (tickets are ints, need to stringify)
+            data = {
+                str(ticket): {
+                    'entry': meta['entry'],
+                    'tp': meta['tp'],
+                    'original_sl': meta['original_sl'],
+                    'symbol': meta['symbol'],
+                    'side': meta['side'],
+                    'last_phase': meta['last_phase']
+                }
+                for ticket, meta in self.position_meta.items()
+            }
+            with open('trailing_stop_meta.json', 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"[TRAIL_WARN] Failed to save position_meta: {e}")
+
+    def _load_position_meta(self):
+        """Load position metadata from disk after restart."""
+        try:
+            if not os.path.exists('trailing_stop_meta.json'):
+                return
+
+            with open('trailing_stop_meta.json', 'r') as f:
+                data = json.load(f)
+
+            # Convert back from string keys to int keys
+            for ticket_str, meta in data.items():
+                ticket = int(ticket_str)
+                self.position_meta[ticket] = meta
+
+            if self.position_meta:
+                print(f"[TRAIL_RESTORE] Loaded {len(self.position_meta)} persisted position(s) from disk")
+        except Exception as e:
+            print(f"[TRAIL_WARN] Failed to load position_meta: {e}")
 
     def _get_profit_to_price_ratio(self, symbol: str) -> Optional[float]:
         """Get $ profit per price unit movement.
@@ -450,6 +500,9 @@ class TrailingStopManager:
                     # Log success
                     phase_names_full = {0: "Entry", 1: "BE", 2: "Lock30c", 3: "Lock50c", 4: "Lock$1"}
                     print(f"[TRAIL$] T{ticket} | {phase_names_full[current_phase]}→{phase_names_full[target_phase]} | profit=${profit:.2f} safe=${safe_profit:.2f} threshold=${threshold:.2f} lock=${lock_profit:.2f} | SL {current_sl:.5f}→{new_sl:.5f}")
+
+                    # Persist phase change immediately
+                    self._save_position_meta()
                 else:
                     retcode = result.retcode if result else 'None'
                     # FIX 4: Better error logging for debugging
