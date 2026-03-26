@@ -363,40 +363,22 @@ class TrailingStopManager:
             # ─── STEP 1: RETRIEVE SIGNAL SL ──────────────────────────────────────
             signal_sl = meta['original_sl']  # From website signal provider
 
-            # ─── STEP 2: CALCULATE MAX LOSS SL (ALWAYS ACTIVE) ───────────────────
-            # Use stable symbol properties, NOT profit-dependent ratio
+            # ─── STEP 2: CALCULATE DYNAMIC PRICE-TO-PROFIT RATIO ───────────────────
+            # Use actual market conditions (price movement per dollar profit)
+            # This adapts to position size and market volatility
+            price_per_dollar = abs(current_price - entry_price) / abs(profit)
+
+            # ─── STEP 3: CALCULATE MAX LOSS SL (ALWAYS ACTIVE) ───────────────────
+            # Use dynamic price_per_dollar to convert $0.70 cap to price movement
             loss_cap = 0.70  # dollars - hard cap, never lose more than this
+            loss_cap_price = loss_cap * price_per_dollar
 
-            try:
-                symbol_info = mt5_module.symbol_info(symbol)
-                if not symbol_info:
-                    print(f"[TRAIL_ERR] T{ticket} Symbol info unavailable for {symbol}")
-                    continue
+            if pos.type == mt5_module.POSITION_TYPE_BUY:
+                max_loss_sl = entry_price - loss_cap_price  # Below entry for BUY
+            else:  # SELL
+                max_loss_sl = entry_price + loss_cap_price  # Above entry for SELL
 
-                tick_value = symbol_info.trade_tick_value
-                tick_size = symbol_info.trade_tick_size
-
-                if tick_size == 0:
-                    print(f"[TRAIL_ERR] T{ticket} Invalid tick_size for {symbol}")
-                    continue
-
-                # Stable conversion: dollars per unit of price movement
-                dollar_per_price = tick_value / tick_size
-
-                # Convert loss cap to price movement
-                price_offset = loss_cap / dollar_per_price
-
-                # Calculate max loss SL
-                if pos.type == mt5_module.POSITION_TYPE_BUY:
-                    max_loss_sl = entry_price - price_offset  # Below entry for BUY
-                else:  # SELL
-                    max_loss_sl = entry_price + price_offset  # Above entry for SELL
-
-            except Exception as e:
-                print(f"[TRAIL_ERR] T{ticket} Exception calculating max_loss_sl: {e}")
-                continue
-
-            # ─── STEP 3: CALCULATE TRAILING SL (SELECTIVE - Only if profit >= $0.60) ───
+            # ─── STEP 4: CALCULATE TRAILING SL (SELECTIVE - Only if profit >= $0.60) ───
             # For trailing SL, use profit-based price_per_dollar (adaptive to position size)
             trailing_sl = None  # Initialize to None
             target_phase = current_phase  # Track for logging
@@ -405,7 +387,6 @@ class TrailingStopManager:
             if profit >= 0.60:
                 # Only calculate trailing if enough profit to lock ($0.30+)
                 # This prevents breakeven (lock_profit=0.00) from being selected
-                price_per_dollar = abs(current_price - entry_price) / abs(profit)
 
                 # Only calculate trailing if profit threshold reached
                 if profit >= 1.50:
@@ -422,13 +403,11 @@ class TrailingStopManager:
                 if current_phase < target_phase:
                     price_move = lock_profit * price_per_dollar
 
-                    # ✓ FIX: Both BUY and SELL add price_move (correct direction for both)
-                    # BUY: SL moves UP (entry + move = higher SL below current price)
-                    # SELL: SL moves UP (entry + move = higher SL above current price for SELL logic)
+                    # Apply directional logic for BUY and SELL
                     if pos.type == mt5_module.POSITION_TYPE_BUY:
                         trailing_sl = entry_price + price_move
                     else:  # SELL
-                        trailing_sl = entry_price + price_move  # ← FIXED: was minus, now plus
+                        trailing_sl = entry_price + price_move
 
             # ─── STEP 4: UNIFIED SL DECISION (Pick safest/tightest SL) ─────────────────
             # Collect all candidate SL values - MUST validate side before using
