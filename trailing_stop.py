@@ -1,23 +1,29 @@
 """
-TRAILING STOP MANAGER - Simple SL + Portfolio Close System
+TRAILING STOP MANAGER - Dynamic SL + Portfolio Close System
 
 System:
-  1. SL Breakeven Protection: Move SL to breakeven when profit >= $0.40
-  2. Portfolio-Level Close: Close ALL positions when:
-     - Number of open positions >= 3 AND
-     - Total P&L >= (num_positions × $1.00)
+  1. RULE 1 - Breakeven with Profit Lock: When profit >= $0.40
+     - Lock minimum $0.05 profit by moving SL above entry
+
+  2. RULE 2 - TP-Based Trailing: When trade reaches 60% of TP distance
+     - Lock 40% of TP distance (progressive SL advancement)
+
+  3. Portfolio-Level Close: Close ALL positions when:
+     - Number of open positions >= 5 AND
+     - Total P&L >= (num_positions × $0.90)
 
 Example:
-  3 open positions with +$3.10 total profit → Close all
-  10 open positions with +$8.50 total profit → Keep open (need $10.00)
-  10 open positions with +$10.10 total profit → Close all
+  5 open positions with +$4.50 total profit → Close all
+  10 open positions with +$9.00 total profit → Close all
+  10 open positions with +$8.50 total profit → Keep open (need $9.00)
 
 SAFETY GUARANTEES:
-  ✓ Never reduces SL (only forward movement to breakeven)
+  ✓ SL only moves forward (never backward)
+  ✓ SL always on correct side of current price
   ✓ Only closes positions at portfolio level, never individual
   ✓ Never touches UNMATCHED/FAILED_CLOSE
   ✓ Never interferes with diff logic or VSL
-  ✓ Uses real MT5 profit, not estimates
+  ✓ Uses real MT5 profit and price data
   ✓ Preserves ticket safety and position integrity
 """
 
@@ -141,13 +147,112 @@ class TrailingStopManager:
                 print(f"[TRAIL_CLEANUP] Removing stale ticket {ticket}")
                 self.remove_position(ticket)
 
+    def _calculate_price_per_dollar(self, current_price: float, entry_price: float, profit: float) -> float:
+        """
+        Calculate price movement per dollar of profit.
+
+        Used for dynamic SL calculations that scale with position size and volatility.
+
+        Args:
+            current_price: Current bid/ask price
+            entry_price: Position entry price
+            profit: Current profit in dollars
+
+        Returns:
+            Price distance per dollar (e.g., 0.0005 = 5 pips per $1 profit)
+        """
+        if profit <= 0:
+            return 0.0
+
+        price_move = abs(current_price - entry_price)
+        return price_move / profit
+
+    def _is_sl_valid_for_buy(self, new_sl: float, current_price: float, old_sl: float) -> bool:
+        """Check if new SL is valid for BUY position."""
+        # SL must be below current price
+        if new_sl >= current_price:
+            return False
+        # SL must move forward (only increase SL for BUY)
+        if new_sl <= old_sl:
+            return False
+        return True
+
+    def _is_sl_valid_for_sell(self, new_sl: float, current_price: float, old_sl: float) -> bool:
+        """Check if new SL is valid for SELL position."""
+        # SL must be above current price
+        if new_sl <= current_price:
+            return False
+        # SL must move forward (only decrease SL for SELL)
+        if new_sl >= old_sl:
+            return False
+        return True
+
+    def _apply_trailing_rules(self, pos, mt5_module) -> Optional[float]:
+        """
+        Apply RULE 1 and RULE 2 to determine new SL.
+
+        Returns:
+            New SL value if should update, None if no update needed
+        """
+        # Get metadata for this position
+        meta = self.position_meta.get(pos.ticket)
+        if not meta:
+            return None
+
+        entry_price = meta['entry']
+        tp = meta['tp']
+
+        # ─── RULE 1: BREAKEVEN WITH PROFIT LOCK ($0.40 profit → lock $0.05) ───
+        if pos.profit >= 0.40:
+            profit_lock = 0.05
+            price_per_dollar = self._calculate_price_per_dollar(pos.price, entry_price, pos.profit)
+
+            if price_per_dollar > 0:
+                price_move = profit_lock * price_per_dollar
+
+                if pos.type == mt5_module.POSITION_TYPE_BUY:
+                    new_sl = entry_price + price_move
+                else:  # SELL
+                    new_sl = entry_price - price_move
+
+                # Validate SL is safe
+                if pos.type == mt5_module.POSITION_TYPE_BUY:
+                    if self._is_sl_valid_for_buy(new_sl, pos.price, pos.sl):
+                        return new_sl
+                else:  # SELL
+                    if self._is_sl_valid_for_sell(new_sl, pos.price, pos.sl):
+                        return new_sl
+
+        # ─── RULE 2: TP-BASED TRAILING (60% of TP → lock 40% of TP) ───
+        tp_distance = abs(tp - entry_price)
+        if tp_distance > 0:
+            current_move = abs(pos.price - entry_price)
+
+            if current_move >= 0.60 * tp_distance:
+                # Trade has reached 60% of way to TP, lock 40% of TP distance
+                lock_move = 0.40 * tp_distance
+
+                if pos.type == mt5_module.POSITION_TYPE_BUY:
+                    new_sl = entry_price + lock_move
+                else:  # SELL
+                    new_sl = entry_price - lock_move
+
+                # Validate SL is safe
+                if pos.type == mt5_module.POSITION_TYPE_BUY:
+                    if self._is_sl_valid_for_buy(new_sl, pos.price, pos.sl):
+                        return new_sl
+                else:  # SELL
+                    if self._is_sl_valid_for_sell(new_sl, pos.price, pos.sl):
+                        return new_sl
+
+        return None
+
     def update_all_positions(self, mt5_module):
         """
-        Simple trailing stop system:
-        1. Move SL to breakeven when profit >= $0.40
-        2. Close ALL positions when:
-           - num_positions >= 3 AND
-           - total_pnl >= (num_positions × $1.00)
+        Dynamic trailing stop system with two progression rules:
+        1. RULE 1: Breakeven with profit lock ($0.40 profit → lock $0.05)
+        2. RULE 2: TP-based trailing (60% of TP distance → lock 40% of TP)
+        3. Portfolio close: All positions when >= 5 positions AND total PnL >= (num × $0.90)
 
         MUST be called every cycle in main loop:
           1. check_virtual_sl_and_close()
@@ -167,55 +272,34 @@ class TrailingStopManager:
         total_pnl = 0
         sl_updates = 0  # Track how many SL updates happened
 
-        # ─── STEP 1: MOVE SL TO BREAKEVEN AT $0.40 PROFIT (ALWAYS ACTIVE) ───
+        # ─── STEP 1: APPLY TRAILING RULES TO EACH POSITION ───
         for pos in all_mt5_positions:
             total_pnl += pos.profit
 
-            if pos.profit >= 0.40:
-                # Calculate breakeven SL + 2 pips buffer
-                sl_buffer = 0.0002  # 2 pips
+            # Apply RULE 1 → RULE 2 logic
+            new_sl = self._apply_trailing_rules(pos, mt5_module)
 
-                if pos.type == mt5_module.POSITION_TYPE_BUY:
-                    # BUY: SL goes 2 pips ABOVE entry (higher = protection from below)
-                    new_sl = pos.price_open + sl_buffer
-                else:  # SELL
-                    # SELL: SL goes 2 pips BELOW entry (lower = protection from above)
-                    new_sl = pos.price_open - sl_buffer
+            if new_sl is not None:
+                # Send SL update to MT5
+                rule_name = "RULE1" if pos.profit >= 0.40 else "RULE2"
+                print(f"[TRAIL_SL] T{pos.ticket} {pos.symbol} {rule_name} profit=${pos.profit:.2f} → SL: {pos.sl:.5f} → {new_sl:.5f}")
 
-                # Only update if moving forward (protective)
-                if pos.type == mt5_module.POSITION_TYPE_BUY and new_sl > pos.sl:
-                    print(f"[TRAIL_SL] T{pos.ticket} {pos.symbol} BUY profit=${pos.profit:.2f} → Move SL to BE: {pos.sl:.5f} → {new_sl:.5f}")
-                    request = {
-                        "action": mt5_module.TRADE_ACTION_SLTP,
-                        "position": pos.ticket,
-                        "sl": new_sl,
-                        "tp": pos.tp
-                    }
-                    result = mt5_module.order_send(request)
-                    if result and result.retcode == mt5_module.TRADE_RETCODE_DONE:
-                        print(f"  [TRAIL_OK] SL updated")
-                        sl_updates += 1
-                    else:
-                        print(f"  [TRAIL_ERR] SL update failed: {result.retcode if result else 'None'}")
+                request = {
+                    "action": mt5_module.TRADE_ACTION_SLTP,
+                    "position": pos.ticket,
+                    "sl": new_sl,
+                    "tp": pos.tp
+                }
+                result = mt5_module.order_send(request)
+                if result and result.retcode == mt5_module.TRADE_RETCODE_DONE:
+                    print(f"  [TRAIL_OK] SL updated")
+                    sl_updates += 1
+                else:
+                    print(f"  [TRAIL_ERR] SL update failed: {result.retcode if result else 'None'}")
 
-                elif pos.type == mt5_module.POSITION_TYPE_SELL and new_sl < pos.sl:
-                    print(f"[TRAIL_SL] T{pos.ticket} {pos.symbol} SELL profit=${pos.profit:.2f} → Move SL to BE: {pos.sl:.5f} → {new_sl:.5f}")
-                    request = {
-                        "action": mt5_module.TRADE_ACTION_SLTP,
-                        "position": pos.ticket,
-                        "sl": new_sl,
-                        "tp": pos.tp
-                    }
-                    result = mt5_module.order_send(request)
-                    if result and result.retcode == mt5_module.TRADE_RETCODE_DONE:
-                        print(f"  [TRAIL_OK] SL updated")
-                        sl_updates += 1
-                    else:
-                        print(f"  [TRAIL_ERR] SL update failed: {result.retcode if result else 'None'}")
-
-        # ─── STEP 2: PORTFOLIO-LEVEL CLOSE (ONLY IF >= 3 POSITIONS) ───────
-        if num_positions >= 3:
-            close_target = num_positions * 1.00  # $1.00 per position
+        # ─── STEP 2: PORTFOLIO-LEVEL CLOSE (ONLY IF >= 5 POSITIONS) ─────
+        if num_positions >= 5:
+            close_target = num_positions * 0.90  # $0.90 per position
 
             if total_pnl >= close_target:
                 print(f"[CLOSE_ALL] TRIGGERING PORTFOLIO CLOSE!")
