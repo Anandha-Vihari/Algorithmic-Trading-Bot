@@ -32,6 +32,7 @@ from signal_manager import (
 from operational_safety import OperationalSafety, log, LogLevel
 from virtual_sl import init_virtual_sl, get_virtual_sl_manager
 from trailing_stop import init_trailing_stop
+from session_filter import is_london_ny_overlap, session_status_string
 from config import SIGNAL_INTERVAL, TRADE_VOLUME, MAX_SIGNAL_AGE
 
 print(f"\n{'='*80}")
@@ -620,10 +621,18 @@ def run_signal_cycle():
 
 
 def signal_thread():
-    """Main loop: fetch signals every N seconds."""
+    """Main loop: fetch signals every N seconds (only during London-NY overlap)."""
 
     while True:
         try:
+            # ──────── SESSION CHECK ────────────────────────────────────────
+            if not is_london_ny_overlap():
+                status = session_status_string()
+                print(status)
+                time.sleep(SIGNAL_INTERVAL)
+                continue
+
+            # ──────── TRADING CYCLE (LONDON-NY OVERLAP ONLY) ────────────────
             # Check if MT5 is still connected
             if not mt5.initialize():
                 print("[ERROR] MT5 disconnected - attempting to reconnect...")
