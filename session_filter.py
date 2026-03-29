@@ -117,6 +117,69 @@ def session_status_string():
     return status
 
 
+def is_signal_in_overlap(signal_time):
+    """
+    Check if a signal was GENERATED during London-NY overlap window.
+
+    This validates the signal's GENERATION time, not the current time.
+    Ignores signals created before 13:00 UTC, even if bot runs during overlap.
+
+    Args:
+        signal_time: datetime object (UTC) of signal generation
+
+    Returns:
+        bool: True if signal generated during 13:00-17:00 UTC, False otherwise
+    """
+    if not signal_time:
+        return False
+
+    # Get hour from signal's creation time
+    hour_utc = signal_time.hour
+    weekday = signal_time.weekday()  # 0=Monday, 4=Friday, 5=Saturday, 6=Sunday
+
+    # Ignore signals created on weekends
+    if weekday >= 5:
+        return False
+
+    # Only accept signals created during 13:00-17:00 UTC overlap
+    if 13 <= hour_utc < 17:
+        return True
+
+    return False
+
+
+def filter_signals_by_session(signals, max_age_seconds=None):
+    """
+    Filter signals to only those generated during London-NY overlap.
+
+    Optionally also filter by freshness (time since generation).
+
+    Args:
+        signals: List of Signal objects (each has .time attribute)
+        max_age_seconds: Optional max age in seconds (e.g. 1800 for 30 min)
+
+    Returns:
+        list: Filtered signals that meet session + age criteria
+    """
+    now_utc = datetime.now(timezone.utc)
+    filtered = []
+
+    for sig in signals:
+        # RULE 1: Signal must have been generated during overlap
+        if not is_signal_in_overlap(sig.time):
+            continue
+
+        # RULE 2: Optional freshness check
+        if max_age_seconds is not None:
+            age_seconds = (now_utc - sig.time).total_seconds()
+            if age_seconds > max_age_seconds:
+                continue
+
+        filtered.append(sig)
+
+    return filtered
+
+
 if __name__ == "__main__":
     print(session_status_string())
     print()

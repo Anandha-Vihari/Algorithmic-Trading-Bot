@@ -32,7 +32,7 @@ from signal_manager import (
 from operational_safety import OperationalSafety, log, LogLevel
 from virtual_sl import init_virtual_sl, get_virtual_sl_manager
 from trailing_stop import init_trailing_stop
-from session_filter import is_london_ny_overlap, session_status_string
+from session_filter import is_london_ny_overlap, session_status_string, is_signal_in_overlap, filter_signals_by_session
 from config import SIGNAL_INTERVAL, TRADE_VOLUME, MAX_SIGNAL_AGE
 
 print(f"\n{'='*80}")
@@ -258,6 +258,20 @@ def run_signal_cycle():
     fresh_signals = SignalFilter.filter_by_age(active_signals, MAX_SIGNAL_AGE)
     print(f"  After age filter: {len(fresh_signals)} fresh active (max age: {MAX_SIGNAL_AGE}s)")
 
+    # ──── FILTER BY SESSION: Only execute signals generated during overlap ────
+    # CRITICAL: Check signal.time (when signal was CREATED), not current time
+    # This prevents delayed execution of old signals even during overlap hours
+
+    overlap_signals = filter_signals_by_session(fresh_signals)
+    print(f"  After session filter: {len(overlap_signals)} signals from overlap (13:00-17:00 UTC)")
+
+    # Log any signals filtered out by session window
+    if len(fresh_signals) > len(overlap_signals):
+        filtered_out = len(fresh_signals) - len(overlap_signals)
+        for sig in fresh_signals:
+            if not is_signal_in_overlap(sig.time):
+                print(f"    [SESSION_SKIP] {sig.pair} {sig.side} created at {sig.time.strftime('%H:%M UTC')} (outside overlap)")
+
     # For position management, use ALL active signals (no age filter)
     # This keeps trades open as long as signal is active on website
     all_active_signals = active_signals
@@ -265,9 +279,10 @@ def run_signal_cycle():
     # ──── DEDUPLICATE: Keep most recent per key ──────────────────────────────
 
     # Sort by time DESC so deduplication keeps most recent
-    fresh_signals_sorted = sorted(fresh_signals, key=lambda s: s.time, reverse=True)
-    signals_to_open = SignalFilter.deduplicate_by_key(fresh_signals_sorted)
-    print(f"  After dedup: {len(signals_to_open)} unique fresh signals for opening")
+    # Use overlap_signals (session-filtered) for opening trades
+    overlap_signals_sorted = sorted(overlap_signals, key=lambda s: s.time, reverse=True)
+    signals_to_open = SignalFilter.deduplicate_by_key(overlap_signals_sorted)
+    print(f"  After dedup: {len(signals_to_open)} unique overlap signals for opening")
 
     # For position management, deduplicate ALL active signals
     all_active_sorted = sorted(all_active_signals, key=lambda s: s.time, reverse=True)
