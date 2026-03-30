@@ -219,7 +219,7 @@ class TrailingStopManager:
         # ─── RULE 2: TP-DISTANCE TRAILING (60% move → lock 40% distance) ───
         tp_distance = abs(tp - entry_price)
         if tp_distance > 0:
-            current_move = abs(pos.price - entry_price)
+            current_move = abs(pos.price_current - entry_price)
 
             if current_move >= 0.60 * tp_distance:
                 # Trade has reached 60% of way to TP
@@ -245,10 +245,10 @@ class TrailingStopManager:
 
         # ─── VALIDATE SL ───
         if pos.type == mt5_module.POSITION_TYPE_BUY:
-            if not self._is_sl_valid_for_buy(new_sl, pos.price, pos.sl):
+            if not self._is_sl_valid_for_buy(new_sl, pos.price_current, pos.sl):
                 return None
         else:  # SELL
-            if not self._is_sl_valid_for_sell(new_sl, pos.price, pos.sl):
+            if not self._is_sl_valid_for_sell(new_sl, pos.price_current, pos.sl):
                 return None
 
         return new_sl
@@ -297,7 +297,7 @@ class TrailingStopManager:
 
                 if meta:
                     tp_distance = abs(meta['tp'] - meta['entry'])
-                    current_move = abs(pos.price - meta['entry'])
+                    current_move = abs(pos.price_current - meta['entry'])
                     if tp_distance > 0 and current_move >= 0.60 * tp_distance:
                         rule_names.append("TP-TRAIL")
 
