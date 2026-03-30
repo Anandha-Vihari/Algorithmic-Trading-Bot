@@ -16,6 +16,7 @@ import threading
 import MetaTrader5 as mt5
 import json
 import os
+import tempfile
 from datetime import datetime, timezone, timedelta
 from collections import Counter
 
@@ -63,7 +64,7 @@ processed_signals_file = "processed_signals.json"
 
 
 def load_processed_signals():
-    """Load set of already-processed signal timestamps."""
+    """Load set of already-processed signal timestamps (fault-tolerant)."""
     try:
         with open(processed_signals_file, 'r') as f:
             data = json.load(f)
@@ -74,15 +75,35 @@ def load_processed_signals():
             if datetime.fromisoformat(v) > cutoff
         }
         return set(filtered.keys())
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return set()  # File doesn't exist yet
+    except json.JSONDecodeError as e:
+        print(f"[ERROR_JSON] Corrupted processed_signals.json: {e}, starting fresh")
+        return set()
+    except Exception as e:
+        print(f"[ERROR_JSON] Failed to load processed_signals: {e}, starting fresh")
         return set()
 
 
 def save_processed_signals(signal_set):
-    """Save processed signal IDs."""
-    data = {sig_id: datetime.now(timezone.utc).isoformat() for sig_id in signal_set}
-    with open(processed_signals_file, 'w') as f:
-        json.dump(data, f)
+    """Save processed signal IDs (fault-tolerant)."""
+    try:
+        data = {sig_id: datetime.now(timezone.utc).isoformat() for sig_id in signal_set}
+        # Atomic write: write to temp file first, then rename
+        import tempfile
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.json', prefix='processed_signals_')
+        try:
+            with os.fdopen(temp_fd, 'w') as f:
+                json.dump(data, f)
+            os.replace(temp_path, processed_signals_file)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+            raise
+    except Exception as e:
+        print(f"[ERROR_JSON] Failed to save processed_signals: {e}, changes may be lost")
 
 
 def get_signal_id(sig: Signal) -> str:
@@ -627,12 +648,23 @@ def run_signal_cycle():
     # Log safety status periodically
     import random
     if random.random() < 0.1:  # ~10% of cycles
-        status = safety.get_status_report()
-        if status["total_escalated"] > 0:
-            log(LogLevel.WARN, f"Safety status - Escalated: {status['total_escalated']}, Tickets: {status['escalated_tickets']}")
+        try:
+            status = safety.get_status_report()
+            if status["total_escalated"] > 0:
+                log(LogLevel.WARN, f"Safety status - Escalated: {status['total_escalated']}, Tickets: {status['escalated_tickets']}")
+        except Exception as e:
+            log(LogLevel.DEBUG, f"[ERROR_STATUS] Failed to get status report: {e}")
 
-    show_open_positions()
-    account_summary()
+    # Display positions and account (fault-tolerant)
+    try:
+        show_open_positions()
+    except Exception as e:
+        print(f"[ERROR_DISPLAY] show_open_positions failed: {e}")
+
+    try:
+        account_summary()
+    except Exception as e:
+        print(f"[ERROR_DISPLAY] account_summary failed: {e}")
 
 
 def signal_thread():
@@ -641,31 +673,46 @@ def signal_thread():
     while True:
         try:
             # ──────── SESSION CHECK (ONLY LOG ON CHANGE) ────────────────────────────────────────
-            if not is_london_ny_overlap():
-                status = session_status_string()
-                if status:  # Only log if state changed
-                    print(status)
+            try:
+                if not is_london_ny_overlap():
+                    status = session_status_string()
+                    if status:  # Only log if state changed
+                        print(status)
+                    time.sleep(SIGNAL_INTERVAL)
+                    continue
+            except Exception as e:
+                print(f"[ERROR_SESSION] Session check failed: {e}")
                 time.sleep(SIGNAL_INTERVAL)
                 continue
 
             # ──────── TRADING CYCLE (LONDON-NY OVERLAP ONLY) ────────────────────────────────────
             # Check if MT5 is still connected
-            if not mt5.initialize():
-                print("[ERROR] MT5 disconnected - attempting to reconnect...")
-                try:
-                    init_mt5()
-                    print("[OK] MT5 reconnected")
-                except Exception as e:
-                    print(f"[ERROR] MT5 reconnection failed: {e}")
-                    time.sleep(5)
-                    continue
+            try:
+                if not mt5.initialize():
+                    print("[ERROR_MT5] MT5 disconnected - attempting to reconnect...")
+                    try:
+                        init_mt5()
+                        print("[OK_MT5] MT5 reconnected")
+                    except Exception as e:
+                        print(f"[ERROR_RECONNECT] MT5 reconnection failed: {e}")
+                        time.sleep(5)
+                        continue
+            except Exception as e:
+                print(f"[ERROR_MT5_CHECK] MT5 init check failed: {e}")
+                time.sleep(5)
+                continue
 
-            run_signal_cycle()
+            # ──────── RUN SIGNAL CYCLE ────────────────────────────────────────────────────────
+            try:
+                run_signal_cycle()
+            except Exception as e:
+                print(f"[ERROR_CYCLE] Signal cycle error: {e}")
+                # Don't re-raise - allow loop to continue
 
         except Exception as e:
-            print(f"[ERROR] Signal cycle failed: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[ERROR_SIGNAL_THREAD] Unexpected error in signal thread: {e}")
+            # Catastrophic fallback - don't exit loop
+            time.sleep(SIGNAL_INTERVAL)
 
         time.sleep(SIGNAL_INTERVAL)
 
@@ -780,16 +827,36 @@ except Exception as e:
 
 threading.Thread(target=signal_thread, daemon=True).start()
 
-# Keep main thread alive
+# Keep main thread alive - FAULT-TOLERANT
 last_alive_log = datetime.now(timezone.utc)
 while True:
-    # Log "active" every 30 minutes
-    now = datetime.now(timezone.utc)
-    if (now - last_alive_log).total_seconds() >= 1800:  # 1800 seconds = 30 minutes
-        print(f"\n[ALIVE] Bot is active - {now.isoformat()}")
-        show_open_positions()
-        account_summary()
-        print()
-        last_alive_log = now
+    try:
+        # Log "active" every 30 minutes
+        now = datetime.now(timezone.utc)
+        if (now - last_alive_log).total_seconds() >= 1800:  # 1800 seconds = 30 minutes
+            try:
+                print(f"\n[ALIVE] Bot is active - {now.isoformat()}")
 
-    time.sleep(60)
+                try:
+                    show_open_positions()
+                except Exception as e:
+                    print(f"[ERROR_ALIVE_POS] Failed to show positions: {e}")
+
+                try:
+                    account_summary()
+                except Exception as e:
+                    print(f"[ERROR_ALIVE_ACCT] Failed to show account: {e}")
+
+                print()
+                last_alive_log = now
+            except Exception as e:
+                print(f"[ERROR_ALIVE_LOG] Alive log failed: {e}")
+                last_alive_log = now  # Don't get stuck if logging fails
+
+        time.sleep(60)
+
+    except Exception as e:
+        print(f"[FATAL_MAIN] Main loop exception (recovering): {e}")
+        # Sleep to prevent spinning, then continue
+        time.sleep(60)
+        continue

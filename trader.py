@@ -478,24 +478,41 @@ def get_position(pair):
 
 
 def show_open_positions():
-    """Display all open positions."""
+    """Display all open positions (fault-tolerant)."""
+    try:
+        positions = mt5.positions_get()
+        if not positions:
+            print("  No open positions")
+            return
 
-    positions = mt5.positions_get()
-    if not positions:
-        print("  No open positions")
-        return
-
-    print(f"  Open positions: {len(positions)}")
-    for p in positions[:5]:  # Show first 5
-        pos_type = "BUY" if p.type == 0 else "SELL"
-        print(f"    [{p.symbol}] {pos_type} @ {p.price_open} | Profit: ${p.profit:.2f}")
+        print(f"  Open positions: {len(positions)}")
+        for p in positions[:5]:  # Show first 5
+            try:
+                pos_type = "BUY" if p.type == 0 else "SELL"
+                symbol = getattr(p, 'symbol', 'UNKNOWN')
+                price_open = getattr(p, 'price_open', 0.0)
+                profit = getattr(p, 'profit', 0.0)
+                print(f"    [{symbol}] {pos_type} @ {price_open:.5f} | Profit: ${profit:.2f}")
+            except Exception as e:
+                print(f"  [ERROR_POS] Failed to display position: {e}")
+                continue
+    except Exception as e:
+        print(f"  [ERROR_MT5] show_open_positions failed: {e}")
 
 
 def account_summary():
-    """Show account stats."""
+    """Show account stats (fault-tolerant)."""
+    try:
+        info = mt5.account_info()
+        if not info:
+            print("  [WARN] Account info unavailable")
+            return
 
-    info = mt5.account_info()
-    if not info:
-        return
-
-    print(f"  Account: Balance ${info.balance:.2f} | Equity ${info.equity:.2f}")
+        try:
+            balance = getattr(info, 'balance', 0.0)
+            equity = getattr(info, 'equity', 0.0)
+            print(f"  Account: Balance ${balance:.2f} | Equity ${equity:.2f}")
+        except Exception as e:
+            print(f"  [ERROR_ACCT] Failed to display account info: {e}")
+    except Exception as e:
+        print(f"  [ERROR_MT5] account_summary failed: {e}")
