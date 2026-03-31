@@ -819,6 +819,26 @@ try:
                     if registered_count > 0:
                         print(f"[STARTUP] Registered {registered_count} position(s) with trailing stop\n")
 
+                    # ──── INFER STAGE FLAGS FROM CURRENT MT5 SL ────────
+                    # For each registered position, infer which stages have already fired
+                    # based on current SL vs entry price (state recovery after restart)
+                    print(f"[STARTUP] Inferring stage flags from current MT5 SL values...")
+                    inferred_count = 0
+                    for key, tickets in positions.positions.items():
+                        if key[0] in ("_UNMATCHED_", "_FAILED_CLOSE_"):
+                            continue
+
+                        for ticket in tickets:
+                            if ticket in trailing_stop_mgr.position_meta:
+                                try:
+                                    trailing_stop_mgr.infer_stage_flags(ticket, mt5)
+                                    inferred_count += 1
+                                except Exception as e:
+                                    print(f"  [STATE_RECOVERY_ERR] Failed to infer flags for T{ticket}: {e}")
+
+                    if inferred_count > 0:
+                        print(f"[STARTUP] Inferred stage flags for {inferred_count} position(s)\n")
+
                 except Exception as e:
                     print(f"[STARTUP] Exception registering positions: {e}\n")
                     import traceback
