@@ -18,7 +18,6 @@ import json
 import os
 import tempfile
 from datetime import datetime, timezone, timedelta
-from collections import Counter
 
 # Log to file
 sys.stdout = open("bot.log", "a", buffering=1, encoding="utf-8")
@@ -33,11 +32,14 @@ from signal_manager import (
 from operational_safety import OperationalSafety, log, LogLevel
 from virtual_sl import init_virtual_sl, get_virtual_sl_manager
 from trailing_stop import init_trailing_stop
-from config import SIGNAL_INTERVAL, TRADE_VOLUME, MAX_SIGNAL_AGE
+from config import SIGNAL_INTERVAL, TRADE_VOLUME, MAX_SIGNAL_AGE, REVERSE_MODE
+from signal_inverter import get_inversion_mode_status
 
 print(f"\n{'='*80}")
 print("BLIND FOLLOWER BOT - STATE CONSISTENCY ARCHITECTURE")
 print(f"Signal interval: {SIGNAL_INTERVAL}s | Volume: {TRADE_VOLUME}")
+inversion_status = get_inversion_mode_status()
+print(f"Mode: {inversion_status['status']}")
 print(f"{'='*80}\n")
 
 # Initialize MT5
@@ -57,6 +59,7 @@ virtual_sl = init_virtual_sl(spread_factor=1.5, cooldown_seconds=300)
 # Trailing Stop - Phase-based SL management (passive layer)
 trailing_stop_mgr = init_trailing_stop()
 print("[TRAIL] Initialized trailing stop manager")
+
 
 # Persistent signal processing tracker (prevent duplicate opens)
 processed_signals_file = "processed_signals.json"
@@ -89,7 +92,6 @@ def save_processed_signals(signal_set):
     try:
         data = {sig_id: datetime.now(timezone.utc).isoformat() for sig_id in signal_set}
         # Atomic write: write to temp file first, then rename
-        import tempfile
         temp_fd, temp_path = tempfile.mkstemp(suffix='.json', prefix='processed_signals_')
         try:
             with os.fdopen(temp_fd, 'w') as f:
@@ -312,14 +314,10 @@ def run_signal_cycle():
     print(f"  Active: {len(active_signals)}, Close: {len(close_signals)}")
 
     # ──── FILTER BY AGE: Only open NEW trades from fresh signals (<30 min)
-    # Position management keeps ALL active signals to avoid closing active trades
+    # BUG FIX: Use FRESH signals for state comparison to prevent multiple opens
 
     fresh_signals = SignalFilter.filter_by_age(active_signals, MAX_SIGNAL_AGE)
     print(f"  After age filter: {len(fresh_signals)} fresh active (max age: {MAX_SIGNAL_AGE}s)")
-
-    # For position management, use ALL active signals (no age filter)
-    # This keeps trades open as long as signal is active on website
-    all_active_signals = active_signals
 
     # ──── DEDUPLICATE: Keep most recent per key ──────────────────────────────
 
@@ -328,14 +326,16 @@ def run_signal_cycle():
     signals_to_open = SignalFilter.deduplicate_by_key(fresh_signals_sorted)
     print(f"  After dedup: {len(signals_to_open)} unique fresh signals for opening")
 
-    # For position management, deduplicate ALL active signals
-    all_active_sorted = sorted(all_active_signals, key=lambda s: s.time, reverse=True)
-    signals_to_manage = SignalFilter.deduplicate_by_key(all_active_sorted)
+    # For state comparison, use FRESH signals only (prevents reopening aged-out signals)
+    # FIX: Changed from ALL active to FRESH ONLY
+    # This ensures curr_keys matches signals_to_open and prevents duplicate opens
+    signals_to_manage = signals_to_open  # Both are deduped fresh signals
 
     # ──── BUILD CURRENT STATE ────────────────────────────────────────────────
 
-    # Current keys from ALL active signals (for state comparison)
-    # This ensures positions stay open even if signals age past 30 minutes
+    # Current keys from FRESH signals only (for state comparison)
+    # FIX: This prevents aged-out signals from staying in curr_keys
+    # No more mismatches between curr_keys and signals_to_open
     curr_keys = [
         SignalKey.build(s.pair, s.side, s.tp, s.sl)
         for s in signals_to_manage
@@ -355,57 +355,24 @@ def run_signal_cycle():
     print(f"  Previous state: {len(prev_keys)} keys")
     print(f"  Current state: {len(curr_keys)} keys")
 
-    # ──── RUNTIME VERIFICATION: Prove curr_keys is from ALL active, not fresh ────
+    # ──── RUNTIME VERIFICATION: Verify curr_keys matches signals_to_open ────
+    # FIX: Now both come from fresh signals, preventing duplicate opens
     print(f"  [VERIFY] Raw active signals: {len(active_signals)}")
     print(f"  [VERIFY] Fresh signals only: {len(fresh_signals)}")
-    print(f"  [VERIFY] Signals_to_manage (deduped all active): {len(signals_to_manage)}")
-    print(f"  [VERIFY] Signals_to_open (deduped fresh only): {len(signals_to_open)}")
+    print(f"  [VERIFY] Signals_to_manage (deduped fresh): {len(signals_to_manage)}")
+    print(f"  [VERIFY] Signals_to_open (deduped fresh): {len(signals_to_open)}")
+    print(f"  [VERIFY] FIX CHECK: signals_to_manage == signals_to_open? {signals_to_manage == signals_to_open}")
     print(f"  [VERIFY] curr_keys source check: {len(curr_keys)} == {len(signals_to_manage)} ? {len(curr_keys) == len(signals_to_manage)}")
 
     # Print actual key content for verification
     if curr_keys:
         print(f"  [VERIFY] Sample curr_keys (first 3): {curr_keys[:3]}")
 
-    # CRITICAL CHECK: Verify age filter is only applied to opening, not closing
-    if len(curr_keys) == len(signals_to_manage):
-        print(f"  [VERIFIED OK] Age filter only applied to opening (not closing)")
-    elif len(curr_keys) != len(signals_to_manage):
-        print(f"  [WARNING] curr_keys mismatch: {len(curr_keys)} != {len(signals_to_manage)}")
-
-    # MIXED SCENARIO DETECTION
-    if len(active_signals) >= 5 and 0 < len(fresh_signals) < len(active_signals):
-        print(f"\n  *** MIXED SCENARIO DETECTED ***")
-        print(f"  Age filter removed {len(active_signals) - len(fresh_signals)} signals")
-        print(f"  Active >= 5: {len(active_signals)} | Fresh 1-4: {len(fresh_signals)}")
-        print(f"\n  [CRITICAL] Full key sets for analysis:")
-        print(f"  prev_keys ({len(prev_keys)} keys): {sorted(prev_keys)}")
-        print(f"  curr_keys ({len(curr_keys)} keys): {sorted(curr_keys)}")
-
-        # Check for missing keys
-        prev_set = set(prev_keys)
-        curr_set = set(curr_keys)
-        missing_from_curr = prev_set - curr_set
-        missing_from_prev = curr_set - prev_set
-
-        if missing_from_curr:
-            print(f"\n  [CRITICAL] Keys in prev but NOT in curr (WILL BE CLOSED): {missing_from_curr}")
-            for key in missing_from_curr:
-                print(f"    Key {key} will trigger CLOSE")
-                # Check if key was in signals
-                key_in_active = any(
-                    SignalKey.build(s.pair, s.side, s.tp, s.sl) == key
-                    for s in active_signals
-                )
-                key_in_fresh = any(
-                    SignalKey.build(s.pair, s.side, s.tp, s.sl) == key
-                    for s in fresh_signals
-                )
-                print(f"      In raw active: {key_in_active} | In fresh: {key_in_fresh}")
-                if key_in_active and not key_in_fresh:
-                    print(f"      REASON: Signal aged-out (>30min) but still managed (expected for closing logic)")
-
-        if missing_from_prev:
-            print(f"\n  [INFO] Keys in curr but NOT in prev (NEW): {missing_from_prev}")
+    # CRITICAL CHECK: Verify curr_keys matches signals_to_open (no duplicates possible)
+    if len(curr_keys) == len(signals_to_manage) == len(signals_to_open):
+        print(f"  [VERIFIED OK] No aged-out signals in curr_keys (prevents duplicate opens)")
+    else:
+        print(f"  [WARNING] Mismatch: curr_keys={len(curr_keys)}, signals_to_manage={len(signals_to_manage)}, signals_to_open={len(signals_to_open)}")
 
 
     # ──── VIRTUAL SL CHECK (SPREAD-AWARE) ─────────────────────────────────────

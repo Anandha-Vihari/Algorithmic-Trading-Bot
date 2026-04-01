@@ -1,5 +1,6 @@
 from bs4 import BeautifulSoup
 import re
+import sys
 from datetime import datetime, timezone, timedelta
 
 
@@ -39,7 +40,6 @@ def parse_time(text):
 
     # FALLBACK: use current time if we can't parse
     # THIS IS A SIGN THE WEBSITE FORMAT HAS CHANGED!
-    import sys
     print("[WARNING] Could not parse timestamp from signal. Using current time as fallback.", file=sys.stderr)
     return datetime.now(timezone.utc)
 

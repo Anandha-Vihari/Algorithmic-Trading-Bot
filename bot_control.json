@@ -1,5 +1,0 @@
-{
-  "enabled": true,
-  "trading_sessions": "all",
-  "notes": "SESSION CONTROL - choose which sessions to trade: 'all', 'london', 'ny', 'overlap', 'asia'"
-}

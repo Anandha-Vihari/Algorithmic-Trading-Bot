@@ -9,7 +9,8 @@ import time
 import subprocess
 import MetaTrader5 as mt5
 from datetime import datetime, timezone
-from config import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_EXE, TRADE_VOLUME
+from config import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_EXE, TRADE_VOLUME, REVERSE_MODE
+from signal_inverter import invert_signal, log_trade_outcome
 
 MAGIC_NUMBER = 777  # All trades use same magic (no frame distinction in blind mode)
 MAX_RETRIES = 3
@@ -131,12 +132,24 @@ def open_trade(signal):
 
     signal = Signal object with attributes:
         pair, side, open_price, tp, sl, frame, ...
+
+    If REVERSE_MODE is enabled, direction and TP/SL are inverted before execution.
     """
 
-    pair = signal.pair
-    side = signal.side
-    tp = signal.tp
-    sl = signal.sl
+    # ──── APPLY SIGNAL INVERSION (if enabled) ────────────────────────────────
+    try:
+        execution_signal, inversion_metadata = invert_signal(signal, REVERSE_MODE)
+    except ValueError as e:
+        print(f"  [INVERSION_REJECT] {signal.pair} - {e}")
+        log_trade_outcome(signal, None, False, {'was_inverted': False, 'original_side': signal.side,
+                                                  'original_tp': signal.tp, 'original_sl': signal.sl,
+                                                  'validation_result': (False, str(e))})
+        return False, None
+
+    pair = execution_signal.pair
+    side = execution_signal.side
+    tp = execution_signal.tp
+    sl = execution_signal.sl
 
     # ─── Get symbol ──────────────────────────────────────────────────────
     sym = None
@@ -151,12 +164,14 @@ def open_trade(signal):
 
     if sym is None:
         print(f"  [SKIP] Symbol {pair} not available")
+        log_trade_outcome(signal, None, False, inversion_metadata, close_price=None)
         return False, None
 
     # ─── FIX 3: Ensure tick data available ───────────────────────────────
     tick = mt5.symbol_info_tick(pair)
     if tick is None:
         print(f"  [SKIP] No tick data for {pair}")
+        log_trade_outcome(signal, None, False, inversion_metadata, close_price=None)
         return False, None
 
     price = tick.ask if side == "BUY" else tick.bid
@@ -198,6 +213,7 @@ def open_trade(signal):
         # Success - break loop
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
             print(f"  [OPENED] {side} {pair} @ {result.price} | SL: {adjusted_sl:.5f} | TP: {adjusted_tp:.5f} | Ticket: {result.order} | Deviation: {deviation}")
+            log_trade_outcome(signal, result.order, True, inversion_metadata)
             return True, result.order
 
         # Price moved - try again with fresh price
@@ -217,8 +233,10 @@ def open_trade(signal):
                 print(f"  [FAILED] Order rejected: retcode={result.retcode} comment={result.comment}")
             else:
                 print(f"  [FAILED] Order send returned None")
+            log_trade_outcome(signal, None, False, inversion_metadata, close_price=None)
             return False, None
 
+    log_trade_outcome(signal, None, False, inversion_metadata, close_price=None)
     return False, None
 
 
@@ -317,7 +335,6 @@ def close_position_by_ticket(ticket, pair=None):
 
     # ──── EXECUTION TRACE ────
     import traceback
-    import inspect
 
     stack = traceback.extract_stack()
     caller_frame = None
@@ -429,6 +446,7 @@ def close_position_by_ticket(ticket, pair=None):
 
                         print(f"  [CLOSED] T{ticket} Entry: {entry_price} -> Close: {close_price} | Movement: {price_diff:.6f} pips | Profit: ${close_profit:.2f}{warning}")
 
+
                         # ─── CLOSE CORRELATION TRACE ─────────────────────────────────────
                         # Log close details for correlation with trailing stop moves
                         close_reason = caller_function if caller_function != "UNKNOWN" else "UNKNOWN"
@@ -461,20 +479,6 @@ def close_position_by_ticket(ticket, pair=None):
 
     print(f"  [WARN] Position ticket {ticket} not found")
     return False
-
-
-
-def get_position(pair):
-    """Get any open position for this pair."""
-
-    for name in (pair, pair + "+"):
-        positions = mt5.positions_get(symbol=name)
-        if positions:
-            for p in positions:
-                if p.magic == MAGIC_NUMBER:
-                    return p
-
-    return None
 
 
 def show_open_positions():
