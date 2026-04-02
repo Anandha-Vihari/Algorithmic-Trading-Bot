@@ -8,7 +8,7 @@ Supports trading configuration for different forex session windows:
   'overlap' - 13:00-17:00 UTC (London-NY overlap)
   'asia' - 22:00-08:00 UTC (Tokyo, Sydney, Singapore)
 
-Configuration: Set trading_sessions in bot_control.json
+Note: Currently unused (preserved for future trading session support)
 """
 
 from datetime import datetime, timezone

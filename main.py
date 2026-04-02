@@ -105,45 +105,6 @@ def save_processed_signals(signal_set):
         print(f"[ERROR_JSON] Failed to save processed_signals: {e}, changes may be lost")
 
 
-def load_bot_control():
-    """Load bot control settings (session mode, etc).
-
-    Returns:
-        dict: {'trading_sessions': str}
-
-    File format (bot_control.json):
-        {
-            "enabled": true,
-            "trading_sessions": "all"
-        }
-
-    Valid modes:
-        'all' - trade 24/7
-        'london' - 08:00-17:00 UTC only
-        'ny' - 13:00-22:00 UTC only
-        'overlap' - 13:00-17:00 UTC only (London-NY overlap)
-        'asia' - 22:00-08:00 UTC (Tokyo, Sydney, Singapore)
-    """
-    try:
-        if not os.path.exists('bot_control.json'):
-            return {'trading_sessions': 'all'}
-
-        with open('bot_control.json', 'r') as f:
-            control = json.load(f)
-
-        mode = control.get('trading_sessions', 'all').lower().strip()
-        valid_modes = ['all', 'london', 'ny', 'overlap', 'asia']
-
-        if mode not in valid_modes:
-            print(f"[WARNING] Invalid trading_sessions mode: {mode}, defaulting to 'all'")
-            mode = 'all'
-
-        return {'trading_sessions': mode}
-    except Exception as e:
-        print(f"[WARNING] Failed to load bot_control.json: {e}, defaulting to 'all'")
-        return {'trading_sessions': 'all'}
-
-
 def get_signal_id(sig: Signal) -> str:
     """Create unique signal ID from signal timestamp + key."""
     key = SignalKey.build(sig.pair, sig.side, sig.tp, sig.sl)
