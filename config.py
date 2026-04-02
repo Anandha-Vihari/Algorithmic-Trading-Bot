@@ -22,4 +22,4 @@ REVERSE_MODE = True   # If True: BUY→SELL, SELL→BUY, TP↔SL swap
 MT5_LOGIN = 24647005
 MT5_PASSWORD = "v8O^%6sJ"
 MT5_SERVER = "VantageInternational-Demo"
-MT5_EXE    = r"D:\MT5s\MetaTrader 5\terminal64.exe" 
+MT5_EXE    = r"C:\Users\h\Desktop\MetaTrader 5\terminal64.exe" 

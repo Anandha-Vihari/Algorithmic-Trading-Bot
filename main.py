@@ -33,7 +33,7 @@ from operational_safety import OperationalSafety, log, LogLevel
 from virtual_sl import init_virtual_sl, get_virtual_sl_manager
 from trailing_stop import init_trailing_stop
 from config import SIGNAL_INTERVAL, TRADE_VOLUME, MAX_SIGNAL_AGE, REVERSE_MODE
-from signal_inverter import get_inversion_mode_status
+from signal_inverter import get_inversion_mode_status, invert_signal
 
 print(f"\n{'='*80}")
 print("BLIND FOLLOWER BOT - STATE CONSISTENCY ARCHITECTURE")
@@ -42,11 +42,59 @@ inversion_status = get_inversion_mode_status()
 print(f"Mode: {inversion_status['status']}")
 print(f"{'='*80}\n")
 
+
+def safe_log(msg: str):
+    """Safely log message even if formatting fails."""
+    try:
+        print(msg)
+    except Exception as e:
+        print(f"[LOG_FAIL] Could not log message: {e}")
+
 # Initialize MT5
 init_mt5()
 
-# Persistent position tracker
+# Persistent position tracker (loads from disk automatically in __init__)
 positions = PositionStore()
+
+# ──── STATE RECONSTRUCTION FROM MT5 ON STARTUP ────────────────────────────────
+# If bot is restarted, rebuild positions_store from MT5 open positions
+# This ensures we don't lose track of trades opened before restart
+
+def reconstruct_positions_from_mt5():
+    """Load open positions from MT5 and register them in positions_store."""
+    print("[STATE_RECOVERY] Reconstructing positions_store from MT5...")
+    try:
+        mt5_positions = mt5.positions_get()
+        if not mt5_positions:
+            print("[STATE_RECOVERY] No open positions in MT5")
+            return 0
+
+        reconstructed_count = 0
+        for pos in mt5_positions:
+            if pos.magic != 777:  # MAGIC_NUMBER from trader.py
+                continue  # Skip positions not opened by this bot
+
+            # Reconstruct from MT5 position
+            pair = pos.symbol.rstrip('+')
+            side = "BUY" if pos.type == 0 else "SELL"  # 0=BUY, 1=SELL
+            key = (pair, side)
+
+            positions.add_ticket(key, pos.ticket)
+            reconstructed_count += 1
+            print(f"  [RECOVER] Registered T{pos.ticket} {pair} {side}")
+
+        print(f"[STATE_RECOVERY] Reconstructed {reconstructed_count} position(s)")
+        positions.save_to_disk()  # Persist after reconstruction
+        return reconstructed_count
+    except Exception as e:
+        print(f"[STATE_RECOVERY] Failed: {e}")
+        return 0
+
+# Reconstruct on startup
+reconstruct_positions_from_mt5()
+
+# Persistent position tracker (now with disk persistence)
+# NOTE: positions initialized with disk load in PositionStore.__init__()
 
 # Operational safety monitoring and retry control
 safety = OperationalSafety(max_retries=5, unmatched_threshold=3)
@@ -319,12 +367,40 @@ def run_signal_cycle():
     fresh_signals = SignalFilter.filter_by_age(active_signals, MAX_SIGNAL_AGE)
     print(f"  After age filter: {len(fresh_signals)} fresh active (max age: {MAX_SIGNAL_AGE}s)")
 
-    # ──── DEDUPLICATE: Keep most recent per key ──────────────────────────────
+    # ──── APPLY INVERSION EARLY (if REVERSE_MODE) ────────────────────────────────
+    # CRITICAL FIX: Invert signals BEFORE deduplication so state keys reflect actual execution
+    # This ensures (pair, executed_side) identity prevents duplicates from TP/SL drift
 
-    # Sort by time DESC so deduplication keeps most recent
+    if REVERSE_MODE:
+        fresh_signals_inverted = []
+        for sig in fresh_signals:
+            try:
+                inv_sig, metadata = invert_signal(sig, REVERSE_MODE)
+                fresh_signals_inverted.append(inv_sig)
+            except Exception as e:
+                print(f"  [INVERT_ERROR] Failed to invert {sig.pair} {sig.side}: {e}")
+                # Fall through - keep original if inversion fails
+                fresh_signals_inverted.append(sig)
+        fresh_signals = fresh_signals_inverted
+        print(f"  [INVERTED] Applied inversion to {len(fresh_signals)} signals")
+
+    # ──── DEDUPLICATE: By EXECUTED identity (pair, executed_side) ────────────────────
+    # CRITICAL: Collapse multiple signals for same (pair, side) into ONE
+    # This prevents duplicates when TP/SL drifts across cycles
+    # Example: Multiple "EURUSD BUY @1.158/1.155" and "EURUSD BUY @1.157/1.154"
+    # both collapse to single EURUSD BUY (executed as SELL if inverted)
+
     fresh_signals_sorted = sorted(fresh_signals, key=lambda s: s.time, reverse=True)
-    signals_to_open = SignalFilter.deduplicate_by_key(fresh_signals_sorted)
-    print(f"  After dedup: {len(signals_to_open)} unique fresh signals for opening")
+
+    # Group by (pair, executed_side) and keep LATEST only
+    seen_exec_identities = {}  # {(pair, side): signal}
+    for sig in fresh_signals_sorted:
+        exec_identity = (sig.pair, sig.side)  # Executed identity (inverted if REVERSE_MODE)
+        if exec_identity not in seen_exec_identities:
+            seen_exec_identities[exec_identity] = sig
+
+    signals_to_open = list(seen_exec_identities.values())
+    print(f"  [EXEC_DEDUP] Deduplicated by (pair, executed_side): {len(fresh_signals_sorted)} → {len(signals_to_open)} unique")
 
     # For state comparison, use FRESH signals only (prevents reopening aged-out signals)
     # FIX: Changed from ALL active to FRESH ONLY
@@ -333,27 +409,26 @@ def run_signal_cycle():
 
     # ──── BUILD CURRENT STATE ────────────────────────────────────────────────
 
-    # Current keys from FRESH signals only (for state comparison)
-    # FIX: This prevents aged-out signals from staying in curr_keys
-    # No more mismatches between curr_keys and signals_to_open
-    curr_keys = [
-        SignalKey.build(s.pair, s.side, s.tp, s.sl)
-        for s in signals_to_manage
-    ]
+    # CRITICAL FIX: Build state keys from EXECUTION IDENTITY ONLY (pair, executed_side)
+    # Remove TP/SL from identity → prevents false "close + reopen" from TP/SL drift
+    # Each (pair, side) can only exist once, regardless of TP/SL changes
+    curr_keys = [(sig.pair, sig.side) for sig in signals_to_open]
 
-    # ──── KEY PRECISION VERIFICATION: Log signal values for cross-cycle comparison ──
-    # This catches any precision issues that could cause keys to change between cycles
-    if signals_to_manage:
-        print(f"\n  [KEY_PRECISION] Signals_to_manage ({len(signals_to_manage)}):")
-        for s in signals_to_manage[:5]:  # Log first 5
-            key = SignalKey.build(s.pair, s.side, s.tp, s.sl)
-            print(f"    {s.pair:7s} {s.side:4s} | TP={s.tp:.10f} SL={s.sl:.10f} | KEY={key}")
+    print(f"  [STATE_KEYS] Built {len(curr_keys)} state keys from execution identity (pair, side only)")
+    print(f"              TP/SL no longer part of identity → TP/SL drift won't cause reopens")
+
+    # ──── KEY PRECISION VERIFICATION: Log execution identity ──────────────────
+    # Show what signals will be tracked for state diff
+    if signals_to_open:
+        print(f"\n  [EXEC_IDENTITY] Signals for state management ({len(signals_to_open)}):")
+        for s in signals_to_open[:5]:  # Log first 5
+            print(f"    {s.pair:7s} {s.side:4s} | TP={s.tp:.5f} SL={s.sl:.5f} (metadata only, not in key)")
 
     # Get previous keys from our tracker
     prev_keys = list(positions.get_all_keys())
 
-    print(f"  Previous state: {len(prev_keys)} keys")
-    print(f"  Current state: {len(curr_keys)} keys")
+    print(f"  Previous state: {len(prev_keys)} keys from positions store")
+    print(f"  Current state: {len(curr_keys)} keys from fresh signals")
 
     # ──── RUNTIME VERIFICATION: Verify curr_keys matches signals_to_open ────
     # FIX: Now both come from fresh signals, preventing duplicate opens
@@ -437,16 +512,6 @@ def run_signal_cycle():
 
         ops = SafeExecutor.prepare_close_operations(closed, positions)
         for key, ticket in ops:
-            # CRITICAL SAFETY: Never close unmatched positions
-            if key[0] == "_UNMATCHED_":
-                log(LogLevel.INFO, f"Skipping UNMATCHED ticket {ticket} - unmatched positions never closed")
-                continue
-
-            # CRITICAL SAFETY: Never retry failed positions (already escalated)
-            if key[0] == "_FAILED_CLOSE_":
-                log(LogLevel.INFO, f"Skipping FAILED_CLOSE ticket {ticket} - escalated tickets never retried")
-                continue
-
             # STALE DETECTION: Check if ticket was manually closed in MT5
             if safety.check_stale_tickets(ticket, mt5_positions):
                 positions.remove_ticket(ticket)
@@ -460,8 +525,9 @@ def run_signal_cycle():
 
             try:
                 # Attempt close
+                pair = key[0]  # 2-tuple: (pair, side)
                 print(f"  [TRIGGER] DIFF_CLOSE_TICKET {ticket} for key {key}")
-                if close_position_by_ticket(ticket, key[0]):
+                if close_position_by_ticket(ticket, pair):
                     # Success - NOW remove ticket from tracking
                     positions.remove_ticket(ticket)
                     virtual_sl.remove_position(ticket)  # Remove from virtual SL tracking
@@ -473,46 +539,47 @@ def run_signal_cycle():
                         log(LogLevel.DEBUG, f"Trailing stop remove failed for T{ticket}: {e}")
                     close_count += 1
                     safety.handle_close_success(ticket)
-                    log(LogLevel.INFO, f"Closed and removed ticket {ticket} for {key[0]}")
+                    log(LogLevel.INFO, f"Closed and removed ticket {ticket} for {pair}")
+
+                    # Persist state after successful close
+                    positions.save_to_disk()
 
                 else:
                     # Failed - ticket STAYS in positions for retry next cycle
                     # Track failure with escalation
-                    action = safety.handle_close_failure(ticket, key[0], "close_position_by_ticket returned False")
+                    action = safety.handle_close_failure(ticket, pair, "close_position_by_ticket returned False")
 
                     if action == "ESCALATE":
-                        # Move to failed close bucket
-                        failed_key = ("_FAILED_CLOSE_", key[0], key[2], key[3])
+                        print(f"  [ESCALATE] T{ticket} escalated after max retries")
+                        # HARD LIMIT: After escalation, give up and remove from tracking
+                        # This prevents infinite retry loops for positions that can't be closed
+                        print(f"  [FORCE_REMOVE] T{ticket} - giving up after escalation, removing from store")
                         positions.remove_ticket(ticket)
-                        positions.add_ticket(failed_key, ticket)
-                        virtual_sl.remove_position(ticket)  # Stop monitoring virtual SL
-                        # Remove from trailing stop (position will not be retried)
+                        virtual_sl.remove_position(ticket)
                         try:
                             trailing_stop_mgr.remove_position(ticket)
-                            print(f"  [TRAIL] Removed T{ticket} (escalated to _FAILED_CLOSE_)")
                         except Exception as e:
                             log(LogLevel.DEBUG, f"Trailing stop remove failed for T{ticket}: {e}")
+                        positions.save_to_disk()
                         escalated_count += 1
-                        log(LogLevel.CRITICAL, f"Escalated ticket {ticket} to _FAILED_CLOSE_ bucket after max retries")
+                        log(LogLevel.WARN, f"Escalated and force-removed ticket {ticket} (no more retries)")
 
             except Exception as e:
                 # Exception - ticket STAYS in positions for retry next cycle
-                action = safety.handle_close_failure(ticket, key[0], str(e))
-
+                action = safety.handle_close_failure(ticket, pair, str(e))
                 if action == "ESCALATE":
-                    # Move to failed close bucket
-                    failed_key = ("_FAILED_CLOSE_", key[0], key[2], key[3])
+                    print(f"  [ESCALATE] T{ticket} escalated after max retries (exception)")
+                    # HARD LIMIT: After escalation, give up and remove from tracking
+                    print(f"  [FORCE_REMOVE] T{ticket} - giving up after escalation, removing from store")
                     positions.remove_ticket(ticket)
-                    positions.add_ticket(failed_key, ticket)
-                    virtual_sl.remove_position(ticket)  # Stop monitoring virtual SL
-                    # Remove from trailing stop (position will not be retried)
+                    virtual_sl.remove_position(ticket)
                     try:
                         trailing_stop_mgr.remove_position(ticket)
-                        print(f"  [TRAIL] Removed T{ticket} (escalated to _FAILED_CLOSE_ on exception)")
-                    except Exception as e:
-                        log(LogLevel.DEBUG, f"Trailing stop remove failed for T{ticket}: {e}")
+                    except Exception:
+                        pass
+                    positions.save_to_disk()
                     escalated_count += 1
-                    log(LogLevel.CRITICAL, f"Escalated ticket {ticket} to _FAILED_CLOSE_ bucket after max retries (exception)")
+                    log(LogLevel.WARN, f"Escalated and force-removed ticket {ticket} due to exception")
 
         print(f"  [TRIGGER] DIFF_CLOSE_END - closed {close_count}, escalated {escalated_count}")
 
@@ -523,21 +590,12 @@ def run_signal_cycle():
         print(f"\n[OPEN] Processing {len(opened)} key(s) to open...")
 
         for key, count in opened.items():
-            pair, side, tp, sl = key
+            pair, side = key  # NEW: 2-tuple (pair, executed_side)
 
-            # CRITICAL: Skip if this position was recently closed by virtual SL
-            # Prevent immediate reopen after bot-triggered close
-            if virtual_sl.is_closed_by_bot(key):
-                log(LogLevel.INFO, f"Skipping {key} - recently closed by virtual SL, waiting for signal reset")
-                continue
-
-            # Find matching signal from FRESH signals only
-            # Only open signals that passed the age filter (< 30 min)
+            # Find matching signal for this (pair, side)
             matching_signals = [
                 s for s in signals_to_open
                 if s.pair == pair and s.side == side
-                and round(s.tp, 3) == round(tp, 3)
-                and round(s.sl, 3) == round(sl, 3)
             ]
 
             if not matching_signals:
@@ -552,23 +610,42 @@ def run_signal_cycle():
                 print(f"  [SKIP] Signal already processed: {sig_id}")
                 continue
 
-            # Open trades for this key
+            # ──── CRITICAL: PRE-OPEN DUPLICATE CHECK ────────────────────────────
+            # Check if (pair, side) is already open in positions store
+            # This is a safety backup to prevent any duplicate opens
+            exec_identity = (sig.pair, sig.side)
+            if positions.has_key(exec_identity):
+                existing_count = positions.count_for_key(exec_identity)
+                print(f"  [SKIP_DUP] {exec_identity} already open ({existing_count} tickets, count={count}), preventing duplicate")
+                log(LogLevel.INFO, f"Skipped duplicate {sig.pair} {sig.side} - already {existing_count} open")
+                continue
+
+            # Open trade(s) for this key
             for i in range(count):
                 try:
                     success, ticket = open_trade(sig)
 
                     if success and ticket:
+                        # ──── CRITICAL: STORE STATE FIRST (before ANY other code) ────
+                        # If anything fails after this, the trade is still in our store
                         positions.add_ticket(key, ticket)
+                        positions.save_to_disk()
+                        print(f"  [STORE] Added {key} → ticket {ticket}")
 
+                        # Optional operations that might fail (wrapped in try/except)
                         # Register with virtual SL for spread-aware monitoring
-                        virtual_sl.add_position(
-                            ticket=ticket,
-                            pair=sig.pair,
-                            side=sig.side,
-                            original_sl=sig.sl,
-                            tp=sig.tp,
-                            entry_price=sig.open_price
-                        )
+                        try:
+                            virtual_sl.add_position(
+                                ticket=ticket,
+                                pair=sig.pair,
+                                side=sig.side,
+                                original_sl=sig.sl,
+                                tp=sig.tp,
+                                entry_price=sig.open_price
+                            )
+                        except Exception as e:
+                            # Virtual SL registration failed but trade is already saved
+                            print(f"  [VSL_ERR] Failed to register with VSL: {e}")
 
                         # Register with trailing stop for SL management
                         try:
@@ -582,11 +659,16 @@ def run_signal_cycle():
                             )
                             print(f"  [TRAIL] Registered T{ticket} {sig.pair} {sig.side}")
                         except Exception as e:
-                            log(LogLevel.ERROR, f"Trailing stop registration failed for T{ticket}: {e}")
+                            # Trailing stop registration failed but trade is already saved
                             print(f"  [TRAIL_ERR] Failed to register T{ticket}: {e}")
 
                         open_count += 1
-                        print(f"  [OK] Opened ticket {ticket} for {key}")
+                        try:
+                            print(f"  [OK] Opened ticket {ticket} for {key}")
+                        except Exception as e:
+                            # Even logging failed, but trade is saved
+                            print(f"  [LOG_ERR] {e}")
+
                         processed_signal_ids.add(sig_id)
                     else:
                         print(f"  [ERR] Failed to open trade for {key}")
@@ -611,29 +693,19 @@ def run_signal_cycle():
 
     # Count position types
     total_tickets = sum(len(t) for t in positions.positions.values())
-    unmatched_tickets = len(positions.positions.get(("_UNMATCHED_",) + tuple([None] * 4), []))
-    failed_close_tickets = len(positions.positions.get(("_FAILED_CLOSE_",) + tuple([None] * 4), []))
 
-    # Determine actual unmatched keys
-    unmatched_count = 0
-    failed_close_count = 0
-    for key in positions.positions.keys():
-        if key[0] == "_UNMATCHED_":
-            unmatched_count += len(positions.positions[key])
-        elif key[0] == "_FAILED_CLOSE_":
-            failed_close_count += len(positions.positions[key])
+    # Log current positions store state (DEBUG) - with defensive error handling
+    try:
+        print(f"  [STORE] Current keys in positions store: {list(positions.get_all_keys())}")
+        print(f"  [STORE] Total tickets tracked: {total_tickets}")
+    except Exception as e:
+        print(f"  [LOG_ERR] Failed to log store state: {e}")
 
-    log(LogLevel.INFO, f"Cycle complete: {open_count} opened, {close_count} closed, {escalated_count} escalated")
-    log(LogLevel.INFO, f"Tracked: {total_tickets} tickets | UNMATCHED: {unmatched_count} | FAILED_CLOSE: {failed_close_count}")
-
-    # Log virtual SL status
-    monitored_count = len(virtual_sl.metadata)
-    closed_by_bot_count = len(virtual_sl.closed_by_bot)
-    if monitored_count > 0 or closed_by_bot_count > 0:
-        log(LogLevel.DEBUG, f"Virtual SL: monitoring {monitored_count} tickets, {closed_by_bot_count} in closed_by_bot")
-
-    # Monitor UNMATCHED growth
-    safety.check_unmatched_growth(unmatched_count)
+    try:
+        log(LogLevel.INFO, f"Cycle complete: {open_count} opened, {close_count} closed, {escalated_count} escalated")
+        log(LogLevel.INFO, f"Tracked: {total_tickets} tickets")
+    except Exception as e:
+        print(f"  [LOG_ERR] Failed to log cycle status: {e}")
 
     # Log safety status periodically
     import random
@@ -757,7 +829,7 @@ try:
                         if key[0] in ("_UNMATCHED_", "_FAILED_CLOSE_"):
                             continue
 
-                        pair, side, tp, sl = key
+                        pair, side = key  # NEW: 2-tuple (pair, executed_side)
 
                         for ticket in tickets:
                             # Check if already in trailing stop (to avoid re-registering)
@@ -776,8 +848,8 @@ try:
                                     symbol=mt5_pos.symbol,
                                     side=side,
                                     entry_price=mt5_pos.price_open,
-                                    tp=tp,
-                                    original_sl=sl
+                                    tp=mt5_pos.tp,  # Use actual MT5 TP, not from key
+                                    original_sl=mt5_pos.sl  # Use actual MT5 SL, not from key
                                 )
                                 registered_count += 1
                             except Exception as e:

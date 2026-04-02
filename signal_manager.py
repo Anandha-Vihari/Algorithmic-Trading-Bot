@@ -206,11 +206,19 @@ class FuzzyMatcher:
 
 
 class PositionStore:
-    """Thread-safe position storage: {key: [ticket1, ticket2, ...]}"""
+    """Thread-safe position storage: {key: [ticket1, ticket2, ...]}
+
+    Updated for new 2-tuple key format: (pair, executed_side)
+    Includes persistence to disk for crash recovery.
+    """
+
+    PERSISTENCE_FILE = "positions_store.json"
 
     def __init__(self):
-        """Initialize empty position store."""
-        self.positions: Dict[Tuple[str, str, float, float], List[int]] = {}
+        """Initialize position store and load persisted state from disk."""
+        self.positions: Dict[Tuple[str, str], List[int]] = {}
+        # Load from disk on startup
+        self.load_from_disk()
 
     def add_ticket(self, key: Tuple, ticket: int):
         """Add ticket to position list for key."""
@@ -281,13 +289,60 @@ class PositionStore:
         }
 
     def from_dict(self, data: dict):
-        """Deserialize from JSON-safe format."""
+        """Deserialize from JSON-safe format (2-tuple keys: pair, side)."""
         self.positions.clear()
         for key_str, tickets in data.items():
-            # Convert string back to tuple
-            pair, side, tp, sl = eval(key_str)  # Safe for our format
-            key = (pair, side, float(tp), float(sl))
-            self.positions[key] = list(tickets)
+            try:
+                # Parse 2-tuple: (pair, side)
+                pair, side = eval(key_str)
+                key = (pair, side)
+                self.positions[key] = list(tickets)
+            except Exception as e:
+                print(f"  [WARN] Skipping corrupted key {key_str}: {e}")
+                continue
+
+    def save_to_disk(self):
+        """Persist positions to disk (call after opening/closing trades)."""
+        import json
+        import os
+        import tempfile
+        try:
+            data = self.to_dict()
+            # Atomic write: temp file first, then atomic rename
+            temp_fd, temp_path = tempfile.mkstemp(suffix='.json', prefix='positions_')
+            try:
+                with os.fdopen(temp_fd, 'w') as f:
+                    json.dump(data, f)
+                os.replace(temp_path, self.PERSISTENCE_FILE)
+                # Uncomment for debug: print(f"  [SAVED] Positions persisted: {len(data)} keys")
+            except Exception:
+                os.close(temp_fd)
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise
+        except Exception as e:
+            print(f"  [SAVE_ERROR] Failed to save positions: {e}")
+
+    def load_from_disk(self):
+        """Load positions from disk on startup or recovery."""
+        import json
+        import os
+        try:
+            if not os.path.exists(self.PERSISTENCE_FILE):
+                # No saved state yet - this is normal on first run
+                return
+
+            with open(self.PERSISTENCE_FILE, 'r') as f:
+                data = json.load(f)
+
+            self.from_dict(data)
+            print(f"  [LOADED] Restored {len(self.positions)} position keys from disk")
+        except json.JSONDecodeError as e:
+            print(f"  [LOAD_ERROR] Corrupted positions_store.json: {e}, starting fresh")
+            self.positions.clear()
+        except Exception as e:
+            print(f"  [LOAD_ERROR] Failed to load positions: {e}, starting fresh")
+            self.positions.clear()
 
 
 class StateDifferencer:

@@ -2,39 +2,35 @@
 TRAILING STOP MANAGER - Point-Based Multi-Stage System
 
 System:
-  1. PRIORITY 1 (Loss Cap): Close at -50 points loss
-  2. PRIORITY 2-4 (Profit Locking): Three-stage SL progression
+  1. PRIORITY 1-3 (Profit Locking): Three-stage SL progression
      - Stage 1: +46 points (when profit >= +92pts)
      - Stage 2: +92 points (when profit >= +138pts)
      - Jump both if profit crosses +138pts in single cycle
-  3. PRIORITY 5 (Take Profit): Handled by MT5 broker at +230pts
-  4. Portfolio-Level Close: Close ALL positions when:
+  2. PRIORITY 4 (Take Profit): Handled by MT5 broker at +230pts
+  3. Portfolio-Level Close: Close ALL positions when:
      - Number of open positions >= 5 AND
      - Total P&L >= (num_positions × $0.90)
 
 State Flags (per trade):
   - stage1_done: Set True when SL moved to entry±46pts
   - stage2_done: Set True when SL moved to entry±92pts
-  - loss_cap_done: Set True when loss cap closes trade (terminal)
 
 Example:
   EURUSD Entry: 1.1000
   - Cycle 1: profit +40pts → No action (stage threshold 92pts not met)
   - Cycle 2: profit +95pts → STAGE1 fires, SL moves to 1.09954 (entry-46pts)
   - Cycle 3: profit +140pts → STAGE2 fires, SL moves to 1.09908 (entry-92pts)
-  - Cycle 4: profit -55pts → LOSS_CAP fires, position closes at market
 
 SAFETY GUARANTEES:
   ✓ Points are deterministic (0.00001 for non-JPY, 0.001 for JPY)
   ✓ SL only moves forward (monotonic protection always increases)
-  ✓ Loss cap always triggered at exactly -50 points
   ✓ State flags persist across restarts
   ✓ Priority evaluation is deterministic (no ambiguity)
   ✓ Each stage fires exactly once per trade
   ✓ Portfolio close logic unchanged and working
 
 CORE PRINCIPLE:
-  "Deterministic point-based protection: loss cap early, lock profit in stages."
+  "Deterministic point-based SL progression: lock profit in stages."
 """
 
 import MetaTrader5 as mt5
@@ -83,7 +79,6 @@ class TrailingStopManager:
             'last_phase': 0,
             'stage1_done': False,
             'stage2_done': False,
-            'loss_cap_done': False,
         }
         point_size = self._get_point_size(symbol)
         print(f"[TRAIL_REGISTER] T{ticket} {symbol} {side} | Entry: {entry_price:.5f} | TP: {tp:.5f} | SL: {original_sl:.5f} | Point: {point_size}")
@@ -119,7 +114,6 @@ class TrailingStopManager:
                     'last_phase': meta['last_phase'],
                     'stage1_done': meta.get('stage1_done', False),
                     'stage2_done': meta.get('stage2_done', False),
-                    'loss_cap_done': meta.get('loss_cap_done', False),
                 }
                 for ticket, meta in self.position_meta.items()
             }
@@ -296,8 +290,6 @@ class TrailingStopManager:
                 meta['stage1_done'] = False
                 meta['stage2_done'] = False
 
-        meta['loss_cap_done'] = False  # No trade survives -50pt loss, they auto-close
-
         print(f"[STATE_RECOVERY] T{ticket} | stage1={meta['stage1_done']} | stage2={meta['stage2_done']} | SL distance: {abs(sl_distance_pts)}pts")
 
     # ──────────────────────────────────────────────────────────────────
@@ -308,12 +300,11 @@ class TrailingStopManager:
         """
         Point-based multi-stage priority system.
 
-        Five priority levels (evaluated in strict order):
-          1. LOSS CAP: Close if profit <= -50 points
-          2. STAGE 1+2 COMBINED: Jump both stages if profit jumps >= 138pts
-          3. STAGE 2 ONLY: Move to 92pts if stage1 already done
-          4. STAGE 1 ONLY: Move to 46pts if profit >= 92pts
-          5. TP: Handled automatically by MT5 broker
+        Four priority levels (evaluated in strict order):
+          1. STAGE 1+2 COMBINED: Jump both stages if profit jumps >= 138pts
+          2. STAGE 2 ONLY: Move to 92pts if stage1 already done
+          3. STAGE 1 ONLY: Move to 46pts if profit >= 92pts
+          4. TP: Handled automatically by MT5 broker
 
         Returns:
             {'ticket': int, 'action': 'close'|'modify', 'new_sl': float, 'reason': str}
@@ -321,7 +312,7 @@ class TrailingStopManager:
         """
         ticket = pos.ticket
         meta = self.position_meta.get(ticket)
-        if not meta or meta.get('loss_cap_done'):
+        if not meta:
             return None
 
         entry = meta['entry']
@@ -335,17 +326,11 @@ class TrailingStopManager:
         # Calculate profit in points
         profit_pts = self._calculate_profit_pts(entry, current_price, side, point_size)
 
-        # ─── PRIORITY 1: LOSS CAP CHECK (ALWAYS FIRST) ───
-        if profit_pts <= -50 and not meta.get('loss_cap_done'):
-            meta['loss_cap_done'] = True
-            print(f"[LOSS_CAP] T{ticket} | {symbol} | {side} | {profit_pts}pts | CLOSE")
-            return {'ticket': ticket, 'action': 'close', 'reason': 'loss_cap'}
-
-        # Remaining priorities only for non-closed positions
+        # Remaining priorities for SL progression
         stage1_done = meta.get('stage1_done', False)
         stage2_done = meta.get('stage2_done', False)
 
-        # ─── PRIORITY 2: STAGE 1 + 2 COMBINED (Jump both if skipped) ───
+        # ─── PRIORITY 1: STAGE 1 + 2 COMBINED (Jump both if skipped) ───
         if profit_pts >= 138 and not stage1_done:
             stage1_sl = self._calculate_stage_sl(entry, 46, side, point_size)
             stage2_sl = self._calculate_stage_sl(entry, 92, side, point_size)
@@ -360,7 +345,7 @@ class TrailingStopManager:
                 print(f"[SL_REJECTED] T{ticket} | reason: broker distance or backward movement")
                 return None
 
-        # ─── PRIORITY 3: STAGE 2 ONLY ───
+        # ─── PRIORITY 2: STAGE 2 ONLY ───
         if profit_pts >= 138 and stage1_done and not stage2_done:
             stage2_sl = self._calculate_stage_sl(entry, 92, side, point_size)
 
@@ -371,7 +356,7 @@ class TrailingStopManager:
             else:
                 return None
 
-        # ─── PRIORITY 4: STAGE 1 ONLY ───
+        # ─── PRIORITY 3: STAGE 1 ONLY ───
         if profit_pts >= 92 and not stage1_done:
             stage1_sl = self._calculate_stage_sl(entry, 46, side, point_size)
 
@@ -382,7 +367,7 @@ class TrailingStopManager:
             else:
                 return None
 
-        # ─── PRIORITY 5: TP (Handled by MT5 broker automatically) ───
+        # ─── PRIORITY 4: TP (Handled by MT5 broker automatically) ───
         return None
 
     def update_all_positions(self, mt5_module):
@@ -390,7 +375,7 @@ class TrailingStopManager:
         Point-based multi-stage SL system with portfolio close:
 
         1. PRIORITY-BASED SL MANAGEMENT:
-           - Evaluate 5 priorities for each position (loss cap → stages → TP)
+           - Evaluate 4 priorities for each position (stages → TP)
            - Only fire each stage once (state flags prevent duplicates)
            - Close or modify SL based on profit points
 
@@ -424,17 +409,8 @@ class TrailingStopManager:
             if action is None:
                 continue  # No action for this position
 
-            # Execute the action
-            if action['action'] == 'close':
-                # Close the position (loss cap triggered)
-                try:
-                    close_position_by_ticket(pos.ticket)
-                    self.remove_position(pos.ticket)
-                    print(f"  [LOSS_CAP_CLOSED] T{pos.ticket}")
-                except Exception as e:
-                    print(f"  [ERROR] Failed to close T{pos.ticket}: {e}")
-
-            elif action['action'] == 'modify':
+            # Execute the action (only 'modify' action after loss cap removal)
+            if action['action'] == 'modify':
                 # Update SL with new value
                 new_sl = action['new_sl']
                 request = {

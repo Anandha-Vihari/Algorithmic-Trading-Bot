@@ -133,18 +133,21 @@ def open_trade(signal):
     signal = Signal object with attributes:
         pair, side, open_price, tp, sl, frame, ...
 
-    If REVERSE_MODE is enabled, direction and TP/SL are inverted before execution.
+    NOTE: Signal is ALREADY inverted if REVERSE_MODE is enabled (done in main.py).
+    This function receives the executed signal and opens it as-is.
     """
 
-    # ──── APPLY SIGNAL INVERSION (if enabled) ────────────────────────────────
-    try:
-        execution_signal, inversion_metadata = invert_signal(signal, REVERSE_MODE)
-    except ValueError as e:
-        print(f"  [INVERSION_REJECT] {signal.pair} - {e}")
-        log_trade_outcome(signal, None, False, {'was_inverted': False, 'original_side': signal.side,
-                                                  'original_tp': signal.tp, 'original_sl': signal.sl,
-                                                  'validation_result': (False, str(e))})
-        return False, None
+    # ──── SIGNAL IS ALREADY INVERTED (if needed) ────────────────────────────────
+    # CRITICAL FIX: Signals are inverted early in main.py to ensure state keys
+    # track execution identity. Here we just use the signal as-is.
+    execution_signal = signal
+    inversion_metadata = {
+        'was_inverted': False,  # Actual inversion status determined in main.py
+        'original_side': signal.side,
+        'original_tp': signal.tp,
+        'original_sl': signal.sl,
+        'validation_result': (True, "Signal already processed/inverted in main.py")
+    }
 
     pair = execution_signal.pair
     side = execution_signal.side

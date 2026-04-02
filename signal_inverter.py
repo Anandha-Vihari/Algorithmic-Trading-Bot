@@ -162,21 +162,24 @@ def log_trade_outcome(signal: Signal, ticket: int, success: bool, metadata: dict
     outcome = "SUCCESS" if success else "FAILED"
 
     original_info = (
-        f"{signal.side:4s} @ {signal.open_price:.5f} | "
+        f"{signal.side} @ {signal.open_price:.5f} | "
         f"TP={signal.tp:.5f} SL={signal.sl:.5f}"
     )
 
     if metadata['was_inverted']:
+        inverted_side = 'SELL' if signal.side == 'BUY' else 'BUY'
         inverted_info = (
-            f"{'SELL' if signal.side == 'BUY' else 'BUY':4s} @ {signal.open_price:.5f} | "
+            f"{inverted_side} @ {signal.open_price:.5f} | "
             f"TP={metadata['original_sl']:.5f} SL={metadata['original_tp']:.5f}"
         )
+        ticket_str = str(ticket) if ticket else 'NONE'
         log_entry = (
-            f"TRADE_OUTCOME | {outcome:6s} | T{ticket if ticket else 'NONE':>10s} | "
+            f"TRADE_OUTCOME | {outcome} | T{ticket_str:>10s} | "
             f"{signal.pair} | Original: {original_info} | Inverted: {inverted_info}"
         )
     else:
-        log_entry = f"TRADE_OUTCOME | {outcome:6s} | T{ticket if ticket else 'NONE':>10s} | {signal.pair} | {original_info}"
+        ticket_str = str(ticket) if ticket else 'NONE'
+        log_entry = f"TRADE_OUTCOME | {outcome} | T{ticket_str:>10s} | {signal.pair} | {original_info}"
 
     if close_price is not None:
         log_entry += f" | Close: {close_price:.5f}"
