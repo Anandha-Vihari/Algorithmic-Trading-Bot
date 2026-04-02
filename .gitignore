@@ -1,6 +1,4 @@
 *.log
-processed_signals.json
-trailing_stop_meta.json
-open_positions.json
+*.json
 __pycache__/
 *.pyc
