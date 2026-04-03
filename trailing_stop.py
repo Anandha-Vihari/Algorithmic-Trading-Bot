@@ -42,20 +42,52 @@ from typing import Dict, Optional
 from datetime import datetime, timezone
 from operational_safety import log, LogLevel
 from trader import close_position_by_ticket
+from atomic_io import atomic_write_json, safe_read_json
 import json
 import os
 
 
 class TrailingStopManager:
-    """Dollar-based trailing stop system using actual MT5 profit."""
+    """Dollar-based trailing stop system using actual MT5 profit.
 
-    def __init__(self):
-        """Initialize trailing stop tracking."""
+    CRITICAL: Each bot instance MUST use its own meta_file for safe concurrent execution.
+    Sharing trailing_stop_meta.json across bots causes race conditions and data loss.
+    """
+
+    def __init__(self, meta_file: str):
+        """Initialize trailing stop tracking with bot-specific file.
+
+        Args:
+            meta_file: Bot-specific file path (e.g., 'trailing_stop_meta_bot_1.json')
+
+        Raises:
+            AssertionError: If meta_file is None or not bot-specific
+        """
+        # Validate meta_file is provided and bot-specific
+        assert meta_file is not None, \
+            "[TRAIL_ERROR] meta_file must be provided (not None)"
+        assert isinstance(meta_file, str) and len(meta_file) > 0, \
+            "[TRAIL_ERROR] meta_file must be non-empty string"
+        assert "bot_" in meta_file, \
+            f"[TRAIL_ERROR] meta_file must be bot-specific (e.g., 'trailing_stop_meta_bot_N.json'), got: {meta_file}"
+
+        # Guard against hardcoded shared filename
+        if meta_file == 'trailing_stop_meta.json':
+            raise ValueError(
+                "[TRAIL_ERROR] UNSAFE: Shared trailing_stop_meta.json detected. "
+                "This causes data corruption across bots. Use bot-specific path."
+            )
+
+        self.meta_file = meta_file
+
         # ticket → {entry, tp, original_sl, symbol, side}
         self.position_meta = {}
 
         # ticket → timestamp when phase changed (for logging)
         self.phase_change_log = {}
+
+        # Log initialization for debugging
+        print(f"[TRAIL_INIT] TrailingStopManager initialized with bot-specific file: {self.meta_file}")
 
         # Load persisted position metadata from previous sessions
         self._load_position_meta()
@@ -106,7 +138,10 @@ class TrailingStopManager:
         self._save_position_meta()
 
     def _save_position_meta(self):
-        """Save position metadata to disk for persistence across restarts."""
+        """Save position metadata to disk for persistence across restarts.
+
+        Uses atomic write to ensure file is never partially written.
+        """
         try:
             # Convert to JSON-serializable format (tickets are ints, need to stringify)
             data = {
@@ -123,19 +158,25 @@ class TrailingStopManager:
                 }
                 for ticket, meta in self.position_meta.items()
             }
-            with open('trailing_stop_meta.json', 'w') as f:
-                json.dump(data, f)
+            # Use atomic write (safe for concurrent access)
+            success = atomic_write_json(self.meta_file, data)
+            if not success:
+                print(f"[TRAIL_WARN] Atomic write failed for {self.meta_file}")
         except Exception as e:
-            print(f"[TRAIL_WARN] Failed to save position_meta: {e}")
+            print(f"[TRAIL_WARN] Failed to save position_meta to {self.meta_file}: {e}")
 
     def _load_position_meta(self):
-        """Load position metadata from disk after restart."""
-        try:
-            if not os.path.exists('trailing_stop_meta.json'):
-                return
+        """Load position metadata from disk after restart.
 
-            with open('trailing_stop_meta.json', 'r') as f:
-                data = json.load(f)
+        Uses safe_read_json with retry logic to handle concurrent access and corruption.
+        """
+        try:
+            # Use safe_read_json (retry logic on decode errors)
+            data = safe_read_json(self.meta_file, max_retries=3, retry_delay=0.1)
+
+            if data is None:
+                # File doesn't exist (first run) - normal case
+                return
 
             # Convert back from string keys to int keys
             for ticket_str, meta in data.items():
@@ -143,9 +184,9 @@ class TrailingStopManager:
                 self.position_meta[ticket] = meta
 
             if self.position_meta:
-                print(f"[TRAIL_RESTORE] Loaded {len(self.position_meta)} persisted position(s) from disk")
+                print(f"[TRAIL_RESTORE] Loaded {len(self.position_meta)} persisted position(s) from {self.meta_file}")
         except Exception as e:
-            print(f"[TRAIL_WARN] Failed to load position_meta: {e}")
+            print(f"[TRAIL_WARN] Failed to load position_meta from {self.meta_file}: {e}")
 
     def reconcile_with_mt5(self, mt5_module):
         """Remove tracking for positions that no longer exist in MT5.
@@ -473,20 +514,28 @@ class TrailingStopManager:
                 print(f"[CLOSE_ALL] Closed {closed_count}/{num_positions} positions")
 
 
+def init_trailing_stop(meta_file: str):
+    """Initialize trailing stop manager with bot-specific file.
 
-def init_trailing_stop():
-    """Initialize trailing stop manager.
+    CRITICAL: meta_file must be bot-specific (e.g., 'trailing_stop_meta_bot_1.json')
 
     Call in main.py during setup:
 
-        trailing_stop_mgr = init_trailing_stop()
+        trailing_stop_mgr = init_trailing_stop(trailing_stop_meta_file)
+
+    Args:
+        meta_file: Bot-specific file path (required, not optional)
+
+    Returns:
+        TrailingStopManager instance
+
+    Raises:
+        AssertionError: If meta_file is None or not bot-specific
     """
-    return TrailingStopManager()
+    assert meta_file is not None, \
+        "[INIT_ERROR] meta_file required — cannot use default or None"
+    assert "bot_" in meta_file, \
+        f"[INIT_ERROR] meta_file must include 'bot_' identifier, got: {meta_file}"
 
-
-def get_trailing_stop_manager():
-    """Get global trailing stop manager (after init_trailing_stop called)."""
-    global _trailing_stop_instance
-    if '_trailing_stop_instance' not in globals():
-        _trailing_stop_instance = TrailingStopManager()
-    return _trailing_stop_instance
+    print(f"[INIT] Creating TrailingStopManager with file: {meta_file}")
+    return TrailingStopManager(meta_file)

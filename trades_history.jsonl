@@ -1,0 +1,10 @@
+{"symbol": "EURUSD", "side": "BUY", "entry_price": 1.0800, "exit_price": 1.0850, "pnl": 50.0, "strategy": "mirror", "close_time": "2026-04-01T10:15:00", "max_profit": 75.0, "max_loss": -10.0}
+{"symbol": "GBPUSD", "side": "SELL", "entry_price": 1.2650, "exit_price": 1.2600, "pnl": 50.0, "strategy": "reverse", "close_time": "2026-04-01T11:30:00", "max_profit": 80.0, "max_loss": -5.0}
+{"symbol": "EURUSD", "side": "SELL", "entry_price": 1.0820, "exit_price": 1.0760, "pnl": 60.0, "strategy": "mirror", "close_time": "2026-04-01T14:45:00", "max_profit": 90.0, "max_loss": -15.0}
+{"symbol": "USDJPY", "side": "BUY", "entry_price": 149.50, "exit_price": 149.20, "pnl": -30.0, "strategy": "time_based", "close_time": "2026-04-02T09:00:00", "max_profit": 40.0, "max_loss": -50.0}
+{"symbol": "EURUSD", "side": "BUY", "entry_price": 1.0835, "exit_price": 1.0875, "pnl": 40.0, "strategy": "mirror", "close_time": "2026-04-02T13:20:00", "max_profit": 60.0, "max_loss": -8.0}
+{"symbol": "GBPUSD", "side": "BUY", "entry_price": 1.2620, "exit_price": 1.2680, "pnl": 60.0, "strategy": "reverse", "close_time": "2026-04-02T15:10:00", "max_profit": 85.0, "max_loss": -20.0}
+{"symbol": "AUDUSD", "side": "SELL", "entry_price": 0.6750, "exit_price": 0.6720, "pnl": 30.0, "strategy": "time_based", "close_time": "2026-04-03T08:30:00", "max_profit": 50.0, "max_loss": -10.0}
+{"symbol": "EURUSD", "side": "SELL", "entry_price": 1.0855, "exit_price": 1.0810, "pnl": 45.0, "strategy": "mirror", "close_time": "2026-04-03T10:45:00", "max_profit": 70.0, "max_loss": -12.0}
+{"symbol": "NZDUSD", "side": "BUY", "entry_price": 0.6150, "exit_price": 0.6180, "pnl": 30.0, "strategy": "reverse", "close_time": "2026-04-03T12:15:00", "max_profit": 55.0, "max_loss": -8.0}
+{"symbol": "USDJPY", "side": "SELL", "entry_price": 149.80, "exit_price": 149.60, "pnl": 20.0, "strategy": "time_based", "close_time": "2026-04-03T14:30:00", "max_profit": 45.0, "max_loss": -25.0}

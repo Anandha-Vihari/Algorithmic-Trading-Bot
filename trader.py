@@ -9,7 +9,7 @@ import time
 import subprocess
 import MetaTrader5 as mt5
 from datetime import datetime, timezone
-from config import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_EXE, TRADE_VOLUME
+from config import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_EXE
 
 MAGIC_NUMBER = 777  # All trades use same magic (no frame distinction in blind mode)
 MAX_RETRIES = 3
@@ -123,14 +123,16 @@ def get_adaptive_deviation(symbol: str) -> int:
         return 100  # Safe default
 
 
-def open_trade(signal):
+def open_trade(signal, volume: float):
     """
     Open a trade exactly as signal says with retry logic.
 
-    Returns: (success: bool, ticket: int or None)
+    Args:
+        signal: Signal object with attributes (pair, side, open_price, tp, sl, frame, ...)
+        volume: Trade volume (lot size) to open
 
-    signal = Signal object with attributes:
-        pair, side, open_price, tp, sl, frame, ...
+    Returns:
+        (success: bool, ticket: int or None)
     """
 
     pair = signal.pair
@@ -177,7 +179,7 @@ def open_trade(signal):
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": pair,
-            "volume": TRADE_VOLUME,
+            "volume": volume,
             "type": order_type,
             "price": price,
             "tp": adjusted_tp,  # Use adjusted TP
