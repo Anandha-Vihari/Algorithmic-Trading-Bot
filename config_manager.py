@@ -40,6 +40,9 @@ class ConfigManager:
         Returns:
             Dictionary with bot configuration
         """
+        # Load global constants (MT5_SERVER and MT5_EXE are shared by all bots)
+        from config import MT5_SERVER, MT5_EXE
+
         if bot_id == 1:
             from config_bot1 import (
                 BOT_ID, BOT_NAME, TRADE_VOLUME, MT5_LOGIN, MT5_PASSWORD,
@@ -52,6 +55,8 @@ class ConfigManager:
                 'TRADE_VOLUME': TRADE_VOLUME,
                 'MT5_LOGIN': MT5_LOGIN,
                 'MT5_PASSWORD': MT5_PASSWORD,
+                'MT5_SERVER': MT5_SERVER,
+                'MT5_EXE': MT5_EXE,
                 'USE_SIGNAL_INVERTER': USE_SIGNAL_INVERTER,
                 'FOLLOW_HOURS_IST_START': FOLLOW_HOURS_IST_START,
                 'FOLLOW_HOURS_IST_END': FOLLOW_HOURS_IST_END,
@@ -69,6 +74,8 @@ class ConfigManager:
                 'TRADE_VOLUME': TRADE_VOLUME,
                 'MT5_LOGIN': MT5_LOGIN,
                 'MT5_PASSWORD': MT5_PASSWORD,
+                'MT5_SERVER': MT5_SERVER,
+                'MT5_EXE': MT5_EXE,
                 'USE_SIGNAL_INVERTER': USE_SIGNAL_INVERTER,
                 'FOLLOW_HOURS_IST_START': None,
                 'FOLLOW_HOURS_IST_END': None,
@@ -86,6 +93,8 @@ class ConfigManager:
                 'TRADE_VOLUME': TRADE_VOLUME,
                 'MT5_LOGIN': MT5_LOGIN,
                 'MT5_PASSWORD': MT5_PASSWORD,
+                'MT5_SERVER': MT5_SERVER,
+                'MT5_EXE': MT5_EXE,
                 'USE_SIGNAL_INVERTER': USE_SIGNAL_INVERTER,
                 'FOLLOW_HOURS_IST_START': None,
                 'FOLLOW_HOURS_IST_END': None,

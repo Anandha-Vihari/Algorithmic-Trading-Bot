@@ -104,8 +104,13 @@ except Exception as e:
 print(f"{'='*80}\n")
 
 
-# Initialize MT5
-init_mt5()
+# Initialize MT5 with bot-specific credentials from config
+init_mt5(
+    mt5_login=config['MT5_LOGIN'],
+    mt5_password=config['MT5_PASSWORD'],
+    mt5_server=config['MT5_SERVER'],
+    mt5_exe=config['MT5_EXE']
+)
 
 # ─── STATE RECOVERY ON STARTUP (NEW v2 feature) ───────────────────────────
 print("[RECOVERY] Attempting full state recovery from disk...")

@@ -9,7 +9,6 @@ import time
 import subprocess
 import MetaTrader5 as mt5
 from datetime import datetime, timezone
-from config import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_EXE
 
 MAGIC_NUMBER = 777  # All trades use same magic (no frame distinction in blind mode)
 MAX_RETRIES = 3
@@ -19,19 +18,30 @@ MAX_CLOSE_ATTEMPTS = 5
 close_attempts = {}
 
 
-def init_mt5():
-    """Initialize MetaTrader5."""
+def init_mt5(mt5_login, mt5_password, mt5_server, mt5_exe):
+    """Initialize MetaTrader5 with bot-specific credentials.
+
+    Args:
+        mt5_login: MT5 account login (bot-specific)
+        mt5_password: MT5 account password (bot-specific)
+        mt5_server: MT5 server name
+        mt5_exe: Path to MT5 terminal executable
+
+    Raises:
+        RuntimeError: If MT5 initialization or login fails
+    """
     if not mt5.initialize():
         print("MT5 not running — launching terminal...")
-        subprocess.Popen(MT5_EXE, creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.Popen(mt5_exe, creationflags=subprocess.CREATE_NO_WINDOW)
         time.sleep(10)
         if not mt5.initialize():
             raise RuntimeError("MT5 init failed after launch")
 
-    if not mt5.login(MT5_LOGIN, MT5_PASSWORD, MT5_SERVER):
-        raise RuntimeError("MT5 login failed")
+    if not mt5.login(mt5_login, mt5_password, mt5_server):
+        raise RuntimeError(f"MT5 login failed for account {mt5_login}")
 
-    print("MT5 connected")
+    account_info = mt5.account_info()
+    print(f"[MT5] Connected to account {mt5_login} ({account_info.name if account_info else 'name unknown'})")
 
 
 def validate_and_adjust_stops(symbol, side, price, tp, sl):
