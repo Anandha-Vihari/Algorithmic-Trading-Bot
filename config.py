@@ -16,10 +16,8 @@ MAX_SIGNAL_AGE = 1800  # Only OPEN fresh signals < 30 min old. Already-open trad
 # ─── TRADING ────────────────────────────────────────────────────────────────
 TRADE_VOLUME = 0.01    # Lot size
 
-MT5_LOGIN = 24446623
-MT5_PASSWORD = "Z2Nf&3eE"
 MT5_SERVER = "VantageInternational-Demo"
-MT5_EXE    = r"D:\MT5s\MetaTrader 5\terminal64.exe"
+MT5_EXE    = r"D:\MT5s\1\terminal64.exe"
 
 # ─── MULTI-BOT TIMING (NEW) ────────────────────────────────────────
 SIGNAL_FETCHER_INTERVAL = 10  # Central fetcher runs every 10 seconds

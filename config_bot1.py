@@ -12,8 +12,8 @@ BOT_NAME = "BOT-INVERTER"
 TRADE_VOLUME = 0.01
 
 # ─── MT5 CREDENTIALS ───────────────────────────────────────────────────────
-MT5_LOGIN = 24446623
-MT5_PASSWORD = "Z2Nf&3eE"
+MT5_LOGIN = 24727931
+MT5_PASSWORD = "MsBc!hO5"
 
 # ─── SIGNAL INVERSION (BOT 1 ONLY) ────────────────────────────────────────
 # Reverses signals during specific IST time window

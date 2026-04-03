@@ -12,8 +12,8 @@ BOT_NAME = "BOT-FOLLOWER"
 TRADE_VOLUME = 0.015
 
 # ─── MT5 CREDENTIALS ───────────────────────────────────────────────────────
-MT5_LOGIN = 24446625
-MT5_PASSWORD = "PLACEHOLDER_PASSWORD_BOT3"
+MT5_LOGIN = 24727961
+MT5_PASSWORD = "Vr3Vn#2I"
 
 # ─── SIGNAL INVERSION (DISABLED FOR BOT 3) ────────────────────────────────
 USE_SIGNAL_INVERTER = False
